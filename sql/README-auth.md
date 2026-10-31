@@ -13,3 +13,14 @@ Kata sandi di-hash dengan pgcrypto bcrypt, biaya 12; gunakan 12 karakter atau le
 Sesi disimpan di database selama 8 jam secara default (`SESSION_TTL_HOURS`). Cookie `sijago_session` bersifat HttpOnly, SameSite=Lax, dan Secure pada production. Logout mencabut sesi server. Menonaktifkan akun/instansi atau mengganti hash kata sandi membatalkan akses sesi yang ada. MFA yang sudah diaktifkan tidak dilewati; akun tersebut ditolak sampai alur MFA tersedia.
 
 Frontend meneruskan API melalui `/api/backend`, sehingga cookie tetap berada di origin frontend. Atur `NEXT_PUBLIC_API_BASE_URL` ke backend dari server Next, serta `FRONTEND_URL` dan `CORS_ALLOWED_ORIGINS` pada backend ke origin frontend yang benar. Gunakan HTTPS saat deployment. Origin tambahan dipisahkan koma; port localhost 3000/3001 hanya diizinkan otomatis pada mode development.
+
+## Membuat akun production
+
+Pilih project, branch, dan database di Neon SQL Editor yang sama dengan `DATABASE_URL` pada service backend Render. Jika tabel belum tersedia, jalankan migrasi dan seed data master terlebih dahulu. Akun dibuat langsung di database; perubahan kode atau redeploy tidak diperlukan untuk menambahkan akun.
+
+- **Admin:** isi email, nama, dan kata sandi sendiri; gunakan `v_role := 'ADMIN'` dan `v_agency_code := NULL` pada blok `DO` di `create-portal-account.sql`.
+- **Petugas instansi:** jalankan kembali blok `DO` dengan email dan kata sandi berbeda, `v_role := 'PETUGAS_INSTANSI'`, serta salah satu kode `PUPR_KOTA_BOGOR`, `BINAMARGA_JABAR`, atau `BBPJN_NASIONAL`. Query mengaktifkan instansi yang dipilih untuk akses akun, tetapi tidak mengisi email resmi penerima laporan.
+
+Login melalui https://sijago-frontend.vercel.app/login. Jika akun belum dikenali, periksa kesamaan database/branch Neon dengan backend Render dan status aktif akun/instansi. Jangan membagikan SQL yang sudah diisi kata sandi atau menyimpannya di Git.
+
+Data simulasi bersifat opsional dan terpisah dari akun; lihat [panduan seed demo](README-demo.md).
