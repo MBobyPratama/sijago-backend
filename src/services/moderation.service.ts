@@ -1,3 +1,5 @@
+import { AuthError } from "./auth.service.js";
+import { authContext } from "../auth-context.js";
 import { eq, desc, and, ne, sql, inArray } from "drizzle-orm";
 import { db } from "../db/index.js";
 import {
@@ -21,29 +23,12 @@ import { buildStrippedPublicImageUrl } from "./cloudinary.service.js";
 import { sendOfficialEscalationEmail } from "./email.service.js";
 
 /**
- * Mengambil atau membuat akun Admin default untuk pencatatan moderasi & eskalasi.
+ * Mengambil admin dari sesi terautentikasi untuk pencatatan moderasi & eskalasi.
  */
-export async function getOrCreateDefaultAdminUser() {
-  const existing = await db
-    .select()
-    .from(users)
-    .where(eq(users.email, "admin.sabira@sijago.id"))
-    .limit(1);
-
-  if (existing[0]) return existing[0];
-
-  const [created] = await db
-    .insert(users)
-    .values({
-      email: "admin.sabira@sijago.id",
-      fullName: "Sabira (Admin Moderator SIJAGO)",
-      passwordHash: "simulated_argon2_hash",
-      role: "SUPER_ADMIN",
-      isActive: true,
-    })
-    .returning();
-
-  return created;
+export async function getAuthenticatedAdminUser() {
+  const admin = authContext.getStore();
+  if (!admin || !["ADMIN", "SUPER_ADMIN"].includes(admin.role)) throw new Error("Sesi admin tidak valid. Silakan masuk kembali.");
+  return admin;
 }
 
 /**
@@ -66,6 +51,7 @@ export async function listEnrichedReports(options?: {
   const allAgencies = await db.select().from(agencies);
   const agencyMap = new Map(allAgencies.map((a) => [a.id, a]));
 
+  const forwardedReports = new Set((await db.select({ reportId: escalations.reportId }).from(escalations)).map(item => item.reportId));
   const results = [];
 
   for (const rep of allReports) {
@@ -141,10 +127,10 @@ export async function listEnrichedReports(options?: {
     };
 
     const dims = [
-      fact?.sizeLengthCm ?? "80",
-      fact?.sizeWidthCm ?? "60",
-      fact?.sizeDepthCm ?? "12",
-    ].join(" × ");
+      fact?.sizeLengthCm != null ? `panjang ${fact.sizeLengthCm} cm` : null,
+      fact?.sizeWidthCm != null ? `lebar ${fact.sizeWidthCm} cm` : null,
+      fact?.sizeDepthCm != null ? `kedalaman ${fact.sizeDepthCm} cm` : null,
+    ].filter(Boolean).join(", ");
 
     results.push({
       id: rep.id,
@@ -158,25 +144,30 @@ export async function listEnrichedReports(options?: {
       status: rep.status,
       category: fact?.category ?? "LUBANG",
       sizeClass: fact?.sizeClass ?? "SEDANG",
-      dimensionsCm: `${dims} cm`,
+      dimensionsCm: dims || (fact?.sizeClass ? `Kelas ${fact.sizeClass.toLowerCase()} (perkiraan warga)` : "Ukuran belum tersedia"),
       districtName: rep.districtName ?? "Bogor Tengah",
       subdistrictName: rep.subdistrictName ?? "Paledang",
       landmark: fact?.landmark ?? rep.suggestedStreetName ?? "Kota Bogor",
       suggestedStreetName: rep.suggestedStreetName ?? "Kota Bogor",
       lat: Number(rep.lat),
       lng: Number(rep.lng),
-      gpsAccuracyMeters: Number(fact?.gpsAccuracyM ?? 8.4),
+      gpsAccuracyMeters: fact?.gpsAccuracyM == null ? null : Number(fact.gpsAccuracyM),
       locationSource: rep.locationSource,
-      exifDistanceMeters: Number(photos[0]?.exifDistanceMeters ?? 6.2),
+      exifDistanceMeters: photos[0]?.exifDistanceMeters == null ? null : Number(photos[0].exifDistanceMeters),
       exifMismatchFlag: Boolean(photos[0]?.exifMismatchFlag),
       upvotes: rep.upvoteCount,
       priorityScore: Number(rep.priorityScore),
       assignedAgency: agency?.name ?? null,
       assignedAgencyCode: agency?.code ?? null,
+      canCancelVerification: rep.status === "TERVERIFIKASI" && !rep.assignedAgencyId && !rep.forwardedAt && !forwardedReports.has(rep.id),
       returnedByAgency: rep.returnedByAgency,
       returnReason: rep.returnReason,
       isRecurrentHotspot: rep.isRecurrentHotspot,
       createdAt: rep.createdAt.toLocaleString("id-ID"),
+      createdAtIso: rep.createdAt.toISOString(),
+      submittedAt: rep.submittedAt?.toISOString() ?? null,
+      observedAt: fact?.observedAt?.toISOString() ?? null,
+      freeText: fact?.freeText ?? null,
       impactTags: fact?.impactTags ?? [],
       conditionTags: tagsRows.map((t) => ({
         code: t.tagCode,
@@ -184,7 +175,7 @@ export async function listEnrichedReports(options?: {
         count: Number(t.count),
       })),
       signoffSummary: {
-        monitoringDaysLeft: 24,
+        monitoringDaysLeft: rep.monitoringEndsAt ? Math.max(0, Math.ceil((rep.monitoringEndsAt.getTime() - Date.now()) / 86400000)) : 0,
         mulusCount,
         cepatRusakCount,
       },
@@ -384,37 +375,58 @@ export async function adminVerifyReport(
 ) {
   const rep = await findReportByIdOrCode(reportIdOrCode);
   if (!rep) throw new Error("REPORT_NOT_FOUND");
-  const adminUser = await getOrCreateDefaultAdminUser();
+  const adminUser = await getAuthenticatedAdminUser();
+  return db.transaction(async tx => {
+    const [current] = await tx.select().from(reports).where(eq(reports.id, rep.id)).for("update");
+    if (current?.status !== "MENUNGGU_VERIFIKASI") throw new AuthError(409, "INVALID_REPORT_STATUS", "Hanya laporan menunggu verifikasi yang dapat diverifikasi.");
 
-  if (adminNoteText && adminNoteText.trim()) {
-    await db.insert(adminNotes).values({
+    if (adminNoteText && adminNoteText.trim()) {
+      await tx.insert(adminNotes).values({
+        reportId: rep.id,
+        authorId: adminUser.id,
+        note: adminNoteText.trim(),
+      });
+    }
+
+    await tx
+      .update(reports)
+      .set({
+        status: "TERVERIFIKASI",
+        verifiedAt: new Date(),
+        returnedByAgency: false,
+        updatedAt: new Date(),
+      })
+      .where(eq(reports.id, rep.id));
+
+    await appendAuditLog({
       reportId: rep.id,
-      authorId: adminUser.id,
-      note: adminNoteText.trim(),
-    });
-  }
+      actorId: adminUser.email,
+      actorType: "ADMIN",
+      actionType: "VERIFY_REPORT",
+      snapshotBefore: { status: rep.status },
+      snapshotAfter: { status: "TERVERIFIKASI", adminNote: adminNoteText ?? null },
+      rawIp,
+    }, tx);
 
-  await db
-    .update(reports)
-    .set({
-      status: "TERVERIFIKASI",
-      verifiedAt: new Date(),
-      returnedByAgency: false,
-      updatedAt: new Date(),
-    })
-    .where(eq(reports.id, rep.id));
-
-  await appendAuditLog({
-    reportId: rep.id,
-    actorId: adminUser.email,
-    actorType: "ADMIN",
-    actionType: "VERIFY_REPORT",
-    snapshotBefore: { status: rep.status },
-    snapshotAfter: { status: "TERVERIFIKASI", adminNote: adminNoteText ?? null },
-    rawIp,
+    return { reportId: rep.id, ticketCode: rep.ticketCode, status: "TERVERIFIKASI" };
   });
+}
 
-  return { reportId: rep.id, ticketCode: rep.ticketCode, status: "TERVERIFIKASI" };
+/** Cancel verification atomically, preserving source facts and audit history. */
+export async function adminCancelVerification(reportIdOrCode: string, reason: unknown, rawIp?: string) {
+  if (typeof reason !== "string" || !reason.trim() || reason.trim().length > 2000) throw new AuthError(400, "INVALID_REASON", "Isi alasan pembatalan, maksimal 2.000 karakter.");
+  const admin = await getAuthenticatedAdminUser();
+  const report = await findReportByIdOrCode(reportIdOrCode);
+  if (!report) throw new AuthError(404, "REPORT_NOT_FOUND", "Laporan tidak ditemukan.");
+  return db.transaction(async tx => {
+    const [current] = await tx.select().from(reports).where(eq(reports.id, report.id)).for("update");
+    const [sent] = await tx.select({ id: escalations.id }).from(escalations).where(eq(escalations.reportId, report.id)).limit(1);
+    if (!current || current.status !== "TERVERIFIKASI" || current.assignedAgencyId || current.forwardedAt || sent) throw new AuthError(409, "CANNOT_CANCEL_VERIFICATION", "Verifikasi hanya dapat dibatalkan sebelum laporan diteruskan ke instansi. Segarkan antrean untuk melihat status terbaru.");
+    await tx.update(reports).set({ status: "MENUNGGU_VERIFIKASI", verifiedAt: null, updatedAt: new Date() }).where(eq(reports.id, report.id));
+    await tx.insert(adminNotes).values({ reportId: report.id, authorId: admin.id, note: `Pembatalan verifikasi: ${reason.trim()}` });
+    await appendAuditLog({ reportId: report.id, actorId: admin.id, actorType: "ADMIN", actionType: "STATUS_CHANGED", snapshotBefore: { status: current.status, verifiedAt: current.verifiedAt }, snapshotAfter: { status: "MENUNGGU_VERIFIKASI", verifiedAt: null, action: "CANCEL_VERIFICATION", reason: reason.trim() }, rawIp }, tx);
+    return { reportId: report.id, ticketCode: report.ticketCode, status: "MENUNGGU_VERIFIKASI" };
+  });
 }
 
 /**
@@ -428,7 +440,7 @@ export async function adminRejectReport(
 ) {
   const rep = await findReportByIdOrCode(reportIdOrCode);
   if (!rep) throw new Error("REPORT_NOT_FOUND");
-  const adminUser = await getOrCreateDefaultAdminUser();
+  const adminUser = await getAuthenticatedAdminUser();
 
   await db
     .update(reports)
@@ -464,7 +476,7 @@ export async function adminMergeDuplicateReport(
   const dup = await findReportByIdOrCode(duplicateIdOrCode);
   const parent = await findReportByIdOrCode(parentIdOrCode);
   if (!dup || !parent) throw new Error("REPORT_NOT_FOUND");
-  const adminUser = await getOrCreateDefaultAdminUser();
+  const adminUser = await getAuthenticatedAdminUser();
 
   const mergedUpvotes = parent.upvoteCount + dup.upvoteCount;
 
@@ -549,99 +561,103 @@ export async function adminEscalateReportToAgency(params: {
   const rep = await findReportByIdOrCode(params.reportIdOrCode);
   if (!rep) throw new Error("REPORT_NOT_FOUND");
 
-  const [agency] = await db
-    .select()
-    .from(agencies)
-    .where(eq(agencies.code, params.agencyCode))
-    .limit(1);
+  return db.transaction(async tx => {
+    const [current] = await tx.select().from(reports).where(eq(reports.id, rep.id)).for("update");
+    if (!current || !["TERVERIFIKASI", "DIBUKA_KEMBALI"].includes(current.status)) throw new AuthError(409, "INVALID_REPORT_STATUS", "Laporan harus terverifikasi sebelum diteruskan ke instansi.");
+    const [agency] = await tx
+      .select()
+      .from(agencies)
+      .where(eq(agencies.code, params.agencyCode))
+      .limit(1);
 
-  if (!agency) throw new Error("AGENCY_NOT_FOUND");
-  const adminUser = await getOrCreateDefaultAdminUser();
+    if (!agency) throw new Error("AGENCY_NOT_FOUND");
+    const adminUser = await getAuthenticatedAdminUser();
 
-  const [draft] = await db
-    .select()
-    .from(reportDrafts)
-    .where(eq(reportDrafts.reportId, rep.id))
-    .orderBy(desc(reportDrafts.createdAt))
-    .limit(1);
+    const [draft] = await tx
+      .select()
+      .from(reportDrafts)
+      .where(eq(reportDrafts.reportId, rep.id))
+      .orderBy(desc(reportDrafts.createdAt))
+      .limit(1);
 
-  const [fact] = await db
-    .select()
-    .from(reportFactVersions)
-    .where(eq(reportFactVersions.reportId, rep.id))
-    .orderBy(desc(reportFactVersions.versionNo))
-    .limit(1);
+    const [fact] = await tx
+      .select()
+      .from(reportFactVersions)
+      .where(eq(reportFactVersions.reportId, rep.id))
+      .orderBy(desc(reportFactVersions.versionNo))
+      .limit(1);
 
-  const permanentLabel =
-    draft?.sourceType === "TEMPLATE" ? "📄 [Draf Template]" : "✨ [Draf Dibantu AI]";
+    const permanentLabel =
+      draft?.sourceType === "TEMPLATE" ? "📄 [Draf Template]" : "✨ [Draf Dibantu AI]";
 
-  const emailResult = await sendOfficialEscalationEmail({
-    ticketCode: rep.ticketCode,
-    agencyName: agency.name,
-    recipientEmails: agency.officialEmails,
-    permanentLabel,
-    title: draft?.title ?? `Laporan ${rep.ticketCode}`,
-    body: draft?.body ?? fact?.freeText ?? "",
-    districtName: rep.districtName ?? "Kota Bogor",
-    landmark: fact?.landmark ?? "Kota Bogor",
-    lat: rep.lat,
-    lng: rep.lng,
-    adminNote: params.adminNoteText,
-  });
+    const emailResult = await sendOfficialEscalationEmail({
+      ticketCode: rep.ticketCode,
+      agencyName: agency.name,
+      recipientEmails: agency.officialEmails,
+      permanentLabel,
+      title: draft?.title ?? `Laporan ${rep.ticketCode}`,
+      body: draft?.body ?? fact?.freeText ?? "",
+      districtName: rep.districtName ?? "Kota Bogor",
+      landmark: fact?.landmark ?? "Kota Bogor",
+      lat: rep.lat,
+      lng: rep.lng,
+      adminNote: params.adminNoteText,
+    });
 
-  const [escalationRecord] = await db
-    .insert(escalations)
-    .values({
+    const [escalationRecord] = await tx
+      .insert(escalations)
+      .values({
+        reportId: rep.id,
+        agencyId: agency.id,
+        sentByUserId: adminUser.id,
+        recipientEmails: emailResult.sentTo,
+        emailSubject: emailResult.subject,
+        emailBodySnapshot: emailResult.bodySnapshot,
+        providerMessageId: emailResult.providerMessageId,
+        deliveryStatus: emailResult.deliveryStatus,
+        failureReason: emailResult.failureReason,
+      })
+      .returning();
+
+    // Aturan FR-5.7 & FR-5.8: Status berubah ke DITERUSKAN jika pengiriman diterima (atau fallback simulasi)
+    await tx
+      .update(reports)
+      .set({
+        status: "DITERUSKAN",
+        assignedAgencyId: agency.id,
+        forwardedAt: new Date(),
+        returnedByAgency: false,
+        updatedAt: new Date(),
+      })
+      .where(eq(reports.id, rep.id));
+
+    await appendAuditLog({
       reportId: rep.id,
-      agencyId: agency.id,
-      sentByUserId: adminUser.id,
-      recipientEmails: emailResult.sentTo,
-      emailSubject: emailResult.subject,
-      emailBodySnapshot: emailResult.bodySnapshot,
-      providerMessageId: emailResult.providerMessageId,
-      deliveryStatus: emailResult.deliveryStatus,
-      failureReason: emailResult.failureReason,
-    })
-    .returning();
+      actorId: adminUser.email,
+      actorType: "ADMIN",
+      actionType: emailResult.success ? "ESCALATION_EMAIL_SENT" : "ESCALATION_EMAIL_FAILED",
+      snapshotBefore: { status: rep.status, assignedAgencyId: rep.assignedAgencyId },
+      snapshotAfter: {
+        status: "DITERUSKAN",
+        agencyCode: agency.code,
+        agencyName: agency.name,
+        sentTo: emailResult.sentTo,
+        providerMessageId: emailResult.providerMessageId,
+        deliveryStatus: emailResult.deliveryStatus,
+      },
+      rawIp: params.rawIp,
+    }, tx);
 
-  // Aturan FR-5.7 & FR-5.8: Status berubah ke DITERUSKAN jika pengiriman diterima (atau fallback simulasi)
-  await db
-    .update(reports)
-    .set({
-      status: "DITERUSKAN",
-      assignedAgencyId: agency.id,
-      forwardedAt: new Date(),
-      returnedByAgency: false,
-      updatedAt: new Date(),
-    })
-    .where(eq(reports.id, rep.id));
-
-  await appendAuditLog({
-    reportId: rep.id,
-    actorId: adminUser.email,
-    actorType: "ADMIN",
-    actionType: emailResult.success ? "ESCALATION_EMAIL_SENT" : "ESCALATION_EMAIL_FAILED",
-    snapshotBefore: { status: rep.status, assignedAgencyId: rep.assignedAgencyId },
-    snapshotAfter: {
-      status: "DITERUSKAN",
-      agencyCode: agency.code,
+    return {
+      escalationId: escalationRecord.id,
+      ticketCode: rep.ticketCode,
       agencyName: agency.name,
       sentTo: emailResult.sentTo,
       providerMessageId: emailResult.providerMessageId,
       deliveryStatus: emailResult.deliveryStatus,
-    },
-    rawIp: params.rawIp,
+      newStatus: "DITERUSKAN",
+    };
   });
-
-  return {
-    escalationId: escalationRecord.id,
-    ticketCode: rep.ticketCode,
-    agencyName: agency.name,
-    sentTo: emailResult.sentTo,
-    providerMessageId: emailResult.providerMessageId,
-    deliveryStatus: emailResult.deliveryStatus,
-    newStatus: "DITERUSKAN",
-  };
 }
 
 /**
@@ -669,7 +685,10 @@ export async function agencyUpdateReportStatus(params: {
     .where(eq(agencies.code, params.agencyCode))
     .limit(1);
 
-  const targetAgency = agency ?? (await db.select().from(agencies).limit(1))[0];
+  if (!agency || rep.assignedAgencyId !== agency.id) throw new Error("Laporan bukan kewenangan instansi ini.");
+  const targetAgency = agency;
+  const afterPhotos = await db.select({ id: reportPhotos.id }).from(reportPhotos).where(and(eq(reportPhotos.reportId, rep.id), eq(reportPhotos.kind, "AFTER")));
+  if (params.newStatus === "SELESAI" && afterPhotos.length === 0) throw new Error("Foto bukti sesudah perbaikan wajib diunggah.");
 
   await db.insert(agencyUpdates).values({
     reportId: rep.id,
@@ -677,7 +696,7 @@ export async function agencyUpdateReportStatus(params: {
     newStatus: params.newStatus,
     plannedDate: params.plannedDate ?? null,
     note: params.note ?? null,
-    afterPhotoIds: params.newStatus === "SELESAI" ? ["after-photo-hotmix-01"] : [],
+    afterPhotoIds: params.newStatus === "SELESAI" ? afterPhotos.map(photo => photo.id) : [],
     isAdminOverride: false,
   });
 
@@ -697,7 +716,7 @@ export async function agencyUpdateReportStatus(params: {
 
   await appendAuditLog({
     reportId: rep.id,
-    actorId: `petugas:${targetAgency.code}`,
+    actorId: authContext.getStore()?.id || `petugas:${targetAgency.code}`,
     actorType: "INSTANSI",
     actionType: "STATUS_CHANGED",
     snapshotBefore: { status: rep.status },
@@ -741,7 +760,7 @@ export async function agencyReturnReportToAdmin(params: {
 
   await appendAuditLog({
     reportId: rep.id,
-    actorId: `petugas:${params.agencyCode}`,
+    actorId: authContext.getStore()?.id || `petugas:${params.agencyCode}`,
     actorType: "INSTANSI",
     actionType: "STATUS_CHANGED",
     snapshotBefore: { status: rep.status },
@@ -773,7 +792,7 @@ export async function updateSystemConfigs(
   updates: Record<string, unknown>,
   rawIp?: string
 ) {
-  const adminUser = await getOrCreateDefaultAdminUser();
+  const adminUser = await getAuthenticatedAdminUser();
 
   for (const [key, value] of Object.entries(updates)) {
     await db

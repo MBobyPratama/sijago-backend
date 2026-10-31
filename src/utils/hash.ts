@@ -8,7 +8,7 @@ export interface CanonicalFactInput {
   sizeDepthCm?: number | string | null;
   sizeClass: string;
   landmark: string;
-  observedAt: string;
+  observedAt: string | null;
   impactTags: string[];
   freeText?: string | null;
   lat: number | string;
@@ -29,7 +29,7 @@ export function computeFactsHash(facts: CanonicalFactInput): string {
     sizeDepthCm: facts.sizeDepthCm != null ? Number(facts.sizeDepthCm) : null,
     sizeClass: facts.sizeClass,
     landmark: facts.landmark.trim(),
-    observedAt: new Date(facts.observedAt).toISOString(),
+    observedAt: facts.observedAt ? new Date(facts.observedAt).toISOString() : null,
     impactTags: [...facts.impactTags].sort(),
     freeText: (facts.freeText ?? "").trim(),
     lat: Number(facts.lat).toFixed(6),

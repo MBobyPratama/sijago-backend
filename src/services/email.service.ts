@@ -10,8 +10,8 @@ const otpStore = new Map<string, { code: string; expiresAt: number; verified: bo
 export async function requestEmailOtp(email: string): Promise<{
   email: string;
   sentViaResend: boolean;
-  demoOtpHint: string;
 }> {
+  if (!resendClient) throw new Error("Layanan email belum dikonfigurasi.");
   const cleanEmail = email.trim().toLowerCase();
   const code = String(Math.floor(100000 + Math.random() * 900000));
   otpStore.set(cleanEmail, {
@@ -48,10 +48,10 @@ export async function requestEmailOtp(email: string): Promise<{
     }
   }
 
+  if (!sentViaResend) { otpStore.delete(cleanEmail); throw new Error("Kode verifikasi belum berhasil dikirim."); }
   return {
     email: cleanEmail,
     sentViaResend,
-    demoOtpHint: code,
   };
 }
 
@@ -62,9 +62,7 @@ export function verifyEmailOtp(email: string, code: string): {
   const cleanEmail = email.trim().toLowerCase();
   const record = otpStore.get(cleanEmail);
 
-  // Izinkan juga kode demo default "849201" agar penjurian MIA2026 selalu lancar
-  const isMatch =
-    code.trim() === "849201" || (record && record.code === code.trim() && Date.now() < record.expiresAt);
+  const isMatch = record && record.code === code.trim() && Date.now() < record.expiresAt;
 
   if (!isMatch) {
     return { valid: false, verifiedEmailHash: "" };
@@ -107,10 +105,7 @@ export async function sendOfficialEscalationEmail(input: SendEscalationEmailInpu
   bodySnapshot: string;
   sentTo: string[];
 }> {
-  const targetEmails =
-    env.SIMULATED_AGENCY_DEFAULT_EMAIL && env.SIMULATED_AGENCY_DEFAULT_EMAIL.includes("@")
-      ? [env.SIMULATED_AGENCY_DEFAULT_EMAIL]
-      : input.recipientEmails;
+  const targetEmails = input.recipientEmails;
 
   const subject = `[ESKALASI RESMI SIJAGO ${input.ticketCode}] ${input.title}`;
   const mapsUrl = `https://www.openstreetmap.org/?mlat=${input.lat}&mlon=${input.lng}#map=17/${input.lat}/${input.lng}`;
@@ -121,7 +116,6 @@ export async function sendOfficialEscalationEmail(input: SendEscalationEmailInpu
     ``,
     `Bersama email ini, Admin Moderator SIJAGO (Sistem Jalan Bogor) meneruskan laporan kerusakan jalan yang telah diverifikasi:`,
     `- Kode Tiket: ${input.ticketCode}`,
-    `- Label Sumber Draf: ${input.permanentLabel}`,
     `- Judul: ${input.title}`,
     `- Deskripsi: ${input.body}`,
     `- Lokasi: ${input.districtName} (${input.landmark})`,
@@ -134,12 +128,12 @@ export async function sendOfficialEscalationEmail(input: SendEscalationEmailInpu
     .filter(Boolean)
     .join("\n");
 
-  if (!resendClient) {
+  if (!resendClient || targetEmails.length === 0) {
     return {
-      success: true,
-      providerMessageId: `sim_resend_${Date.now()}`,
-      deliveryStatus: "SENT",
-      failureReason: null,
+      success: false,
+      providerMessageId: null,
+      deliveryStatus: "FAILED",
+      failureReason: "Layanan email atau alamat instansi belum dikonfigurasi.",
       subject,
       bodySnapshot,
       sentTo: targetEmails,
@@ -161,7 +155,7 @@ export async function sendOfficialEscalationEmail(input: SendEscalationEmailInpu
             <p>Laporan kerusakan jalan berikut telah diverifikasi oleh Admin SIJAGO dan diteruskan sesuai kewenangan ruas jalan:</p>
             <div style="background: #f8fafc; border: 1px solid #e2e8f0; padding: 14px; border-radius: 8px; margin: 12px 0;">
               <div><strong>Kode Tiket:</strong> ${input.ticketCode}</div>
-              <div><strong>Label Draf Permanen:</strong> <span style="color: #4f46e5; font-weight: 700;">${input.permanentLabel}</span></div>
+
               <div style="margin-top: 8px; font-weight: 700; font-size: 15px;">${input.title}</div>
               <p style="margin: 6px 0;">${input.body}</p>
               <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 10px 0;" />

@@ -29,6 +29,10 @@ async function runMigrations() {
     }
   }
 
+  await db.execute(sql.raw(`ALTER TABLE report_fact_versions ALTER COLUMN observed_at DROP NOT NULL;`));
+  await db.execute(sql.raw(fs.readFileSync(path.resolve(process.cwd(), "drizzle/0002_link_report_photos.sql"), "utf-8")));
+  await db.execute(sql.raw(fs.readFileSync(path.resolve(process.cwd(), "drizzle/0003_auth_sessions.sql"), "utf-8")));
+
   // Indeks GIST Spasial PostGIS (FR-1.4 & FR-1.9)
   await db.execute(
     sql.raw(`CREATE INDEX IF NOT EXISTS idx_reports_location_gist ON reports USING GIST (location);`)

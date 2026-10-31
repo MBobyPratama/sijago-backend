@@ -6,6 +6,8 @@ const envSchema = z.object({
   PORT: z.coerce.number().default(4000),
   API_PREFIX: z.string().default("/v1"),
   FRONTEND_URL: z.string().default("http://localhost:3000"),
+  CORS_ALLOWED_ORIGINS: z.string().default(""),
+  SESSION_TTL_HOURS: z.coerce.number().min(1).max(168).default(8),
 
   // Database (Neon PostgreSQL + PostGIS)
   DATABASE_URL: z.string().default("postgresql://postgres:postgres@localhost:5432/sijago"),

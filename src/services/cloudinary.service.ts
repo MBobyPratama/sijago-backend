@@ -24,11 +24,11 @@ export function generateCloudinaryUploadSignature() {
   if (!env.CLOUDINARY_API_SECRET || !env.CLOUDINARY_API_KEY || !env.CLOUDINARY_CLOUD_NAME) {
     return {
       configured: false,
-      cloudName: env.CLOUDINARY_CLOUD_NAME || "demo",
+      cloudName: env.CLOUDINARY_CLOUD_NAME || "",
       apiKey: env.CLOUDINARY_API_KEY || "",
       timestamp,
       folder,
-      signature: "unconfigured_cloudinary_fallback",
+      signature: "",
     };
   }
 

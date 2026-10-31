@@ -1,4 +1,4 @@
-import { eq, sql, desc, and, ne } from "drizzle-orm";
+import { eq, sql, desc, and, inArray, or, isNull } from "drizzle-orm";
 import crypto from "node:crypto";
 import { db } from "../db/index.js";
 import {
@@ -64,12 +64,11 @@ export async function findNearbyActiveReports(
     .from(reports)
     .where(
       and(
-        ne(reports.status, "DRAFT"),
-        ne(reports.status, "DITOLAK"),
-        ne(reports.status, "DITUTUP"),
+        inArray(reports.status, ["TERVERIFIKASI", "DITERUSKAN", "DIPROSES", "SELESAI", "DIBUKA_KEMBALI"]),
         sql`ST_DWithin(location::geography, ST_GeogFromText(${pointWkt}), ${radiusMeters})`
       )
     )
+    .orderBy(sql`ST_Distance(location::geography, ST_GeogFromText(${pointWkt}))`, reports.id)
     .limit(3);
 
   return rows;
@@ -133,7 +132,7 @@ export interface SaveReportFactsPayload {
   sizeWidthCm?: number | null;
   sizeDepthCm?: number | null;
   landmark: string;
-  observedAt?: string;
+  observedAt?: string | null;
   impactTags?: string[];
   freeText?: string | null;
   photoIds?: string[];
@@ -141,10 +140,39 @@ export interface SaveReportFactsPayload {
   shareIdentityWithAgency?: boolean;
 }
 
+/** Classes are citizen estimates; numeric dimensions remain optional for older clients. */
+function validateReportFacts(payload: SaveReportFactsPayload) {
+  if (!["KECIL", "SEDANG", "BESAR"].includes(payload.sizeClass)) throw new Error("Pilih kelas ukuran kecil, sedang, atau besar.");
+  if (payload.observedAt && (!Number.isFinite(Date.parse(payload.observedAt)) || Date.parse(payload.observedAt) > Date.now())) throw new Error("Waktu pengamatan tidak valid atau berada di masa depan.");
+  if (!payload.landmark?.trim()) throw new Error("Patokan lokasi wajib diisi.");
+  if (!Number.isFinite(payload.lat) || !Number.isFinite(payload.lng)) throw new Error("Koordinat lokasi tidak valid.");
+  if (!Array.isArray(payload.photoIds) || payload.photoIds.length === 0) throw new Error("Tambahkan foto kerusakan terlebih dahulu.");
+  for (const value of [payload.sizeLengthCm, payload.sizeWidthCm, payload.sizeDepthCm]) {
+    if (value != null && (!Number.isFinite(value) || value <= 0)) throw new Error("Ukuran numerik harus lebih dari nol jika diisi.");
+  }
+}
+
+type PhotoTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/** Claim uploaded evidence atomically; never move evidence belonging to another report. */
+export async function linkReportPhotos(tx: PhotoTransaction, reportId: string, photoIds: string[]) {
+  const ids = [...new Set(photoIds)];
+  if (ids.length === 0 || ids.some(id => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))) {
+    throw new Error("Foto tidak valid. Unggah kembali foto kerusakan.");
+  }
+  const linked = await tx.update(reportPhotos).set({ reportId }).where(and(
+    inArray(reportPhotos.id, ids),
+    inArray(reportPhotos.kind, ["REPORT", "BEFORE"]),
+    or(isNull(reportPhotos.reportId), eq(reportPhotos.reportId, reportId)),
+  )).returning({ id: reportPhotos.id });
+  if (linked.length !== ids.length) throw new Error("Foto tidak ditemukan atau sudah digunakan laporan lain. Unggah kembali foto Anda.");
+}
+
 /**
  * POST /v1/reports — Inisialisasi laporan baru berstatus DRAFT beserta Versi 1 Fakta Asal (`facts_hash`).
  */
 export async function createDraftReportWithFacts(payload: SaveReportFactsPayload) {
+  validateReportFacts(payload);
   const reporter = await getOrCreateReporter({
     deviceId: payload.deviceId,
     contactEmail: payload.contactEmail,
@@ -153,10 +181,10 @@ export async function createDraftReportWithFacts(payload: SaveReportFactsPayload
 
   const observedAtIso = payload.observedAt
     ? new Date(payload.observedAt).toISOString()
-    : new Date().toISOString();
+    : null;
 
   const photoIds =
-    payload.photoIds && payload.photoIds.length > 0 ? payload.photoIds : ["default-bogor-photo"];
+    payload.photoIds!;
 
   const factsHash = computeFactsHash({
     category: payload.category,
@@ -178,7 +206,8 @@ export async function createDraftReportWithFacts(payload: SaveReportFactsPayload
   const ticketCode = `SJG-2026-${randomSuffix}`;
   const trackingToken = `trk_${crypto.randomBytes(12).toString("hex")}`;
 
-  const [report] = await db
+  return db.transaction(async (tx) => {
+  const [report] = await tx
     .insert(reports)
     .values({
       ticketCode,
@@ -197,7 +226,9 @@ export async function createDraftReportWithFacts(payload: SaveReportFactsPayload
     })
     .returning();
 
-  const [factVersion] = await db
+  await linkReportPhotos(tx, report.id, photoIds);
+
+  const [factVersion] = await tx
     .insert(reportFactVersions)
     .values({
       reportId: report.id,
@@ -208,7 +239,7 @@ export async function createDraftReportWithFacts(payload: SaveReportFactsPayload
       sizeDepthCm: payload.sizeDepthCm != null ? String(payload.sizeDepthCm) : null,
       sizeClass: payload.sizeClass,
       landmark: payload.landmark,
-      observedAt: new Date(observedAtIso),
+      observedAt: observedAtIso ? new Date(observedAtIso) : null,
       impactTags: payload.impactTags ?? [],
       freeText: payload.freeText ?? null,
       lat: String(payload.lat),
@@ -220,7 +251,7 @@ export async function createDraftReportWithFacts(payload: SaveReportFactsPayload
     })
     .returning();
 
-  await db
+  await tx
     .update(reports)
     .set({ currentFactsVersionId: factVersion.id })
     .where(eq(reports.id, report.id));
@@ -234,6 +265,7 @@ export async function createDraftReportWithFacts(payload: SaveReportFactsPayload
     districtName,
     subdistrictName,
   };
+  });
 }
 
 /**
@@ -248,17 +280,19 @@ export async function updateReportFactsAndInvalidateApproval(
   payload: SaveReportFactsPayload,
   rawIp?: string
 ) {
-  const existingReport = await db
+  validateReportFacts(payload);
+  return db.transaction(async (tx) => {
+  const existingReport = await tx
     .select()
     .from(reports)
     .where(eq(reports.id, reportId))
-    .limit(1);
+    .limit(1).for("update");
 
   if (!existingReport[0]) {
     throw new Error("REPORT_NOT_FOUND");
   }
 
-  const lastVersion = await db
+  const lastVersion = await tx
     .select()
     .from(reportFactVersions)
     .where(eq(reportFactVersions.reportId, reportId))
@@ -268,9 +302,11 @@ export async function updateReportFactsAndInvalidateApproval(
   const nextVersionNo = (lastVersion[0]?.versionNo ?? 0) + 1;
   const observedAtIso = payload.observedAt
     ? new Date(payload.observedAt).toISOString()
-    : new Date().toISOString();
+    : null;
   const photoIds =
-    payload.photoIds && payload.photoIds.length > 0 ? payload.photoIds : ["default-bogor-photo"];
+    payload.photoIds!;
+
+  await linkReportPhotos(tx, reportId, photoIds);
 
   const newFactsHash = computeFactsHash({
     category: payload.category,
@@ -290,7 +326,7 @@ export async function updateReportFactsAndInvalidateApproval(
   const hashChanged = newFactsHash !== existingReport[0].currentFactsHash;
   const { districtName, subdistrictName } = resolveBogorDistrict(payload.lat, payload.lng);
 
-  const [newFactVersion] = await db
+  const [newFactVersion] = await tx
     .insert(reportFactVersions)
     .values({
       reportId,
@@ -301,7 +337,7 @@ export async function updateReportFactsAndInvalidateApproval(
       sizeDepthCm: payload.sizeDepthCm != null ? String(payload.sizeDepthCm) : null,
       sizeClass: payload.sizeClass,
       landmark: payload.landmark,
-      observedAt: new Date(observedAtIso),
+      observedAt: observedAtIso ? new Date(observedAtIso) : null,
       impactTags: payload.impactTags ?? [],
       freeText: payload.freeText ?? null,
       lat: String(payload.lat),
@@ -315,13 +351,13 @@ export async function updateReportFactsAndInvalidateApproval(
 
   if (hashChanged) {
     // 1. Tandai seluruh draf sebelumnya kedaluwarsa (is_stale = true)
-    await db
+    await tx
       .update(reportDrafts)
       .set({ isStale: true })
       .where(eq(reportDrafts.reportId, reportId));
 
     // 2. Batalkan seluruh persetujuan yang pernah diberikan
-    await db
+    await tx
       .update(reportApprovals)
       .set({
         isValid: false,
@@ -331,7 +367,7 @@ export async function updateReportFactsAndInvalidateApproval(
       .where(eq(reportApprovals.reportId, reportId));
 
     // 3. Perbarui laporan utama & kosongkan approvedDraftId
-    await db
+    await tx
       .update(reports)
       .set({
         location: { lng: payload.lng, lat: payload.lat },
@@ -363,7 +399,7 @@ export async function updateReportFactsAndInvalidateApproval(
         sizeDepthCm: payload.sizeDepthCm,
       },
       rawIp,
-    });
+    }, tx);
 
     await appendAuditLog({
       reportId,
@@ -377,7 +413,7 @@ export async function updateReportFactsAndInvalidateApproval(
         newFactsHash,
       },
       rawIp,
-    });
+    }, tx);
   }
 
   return {
@@ -389,6 +425,7 @@ export async function updateReportFactsAndInvalidateApproval(
       ? "Data Fakta Asal Anda telah berubah. Persetujuan sebelumnya dibatalkan otomatis. Silakan buat ulang dan tinjau kembali draf sebelum mengirim."
       : null,
   };
+  });
 }
 
 /**
@@ -421,7 +458,7 @@ export async function generateAndSaveReportDraft(
     sizeWidthCm: factVersion.sizeWidthCm,
     sizeDepthCm: factVersion.sizeDepthCm,
     landmark: factVersion.landmark,
-    observedAt: factVersion.observedAt.toISOString(),
+    observedAt: factVersion.observedAt?.toISOString() ?? null,
     impactTags: factVersion.impactTags ?? [],
     freeText: factVersion.freeText,
     lat: factVersion.lat,
@@ -429,21 +466,8 @@ export async function generateAndSaveReportDraft(
     photoIds: factVersion.photoIds ?? [],
   };
 
-  let draftResult = await generateReportDraft(canonicalInput);
-  if (options?.forceFallback && draftResult.sourceType === "AI") {
-    const { buildDeterministicTemplateDraft } = await import("./aiDraft.service.js");
-    const tpl = buildDeterministicTemplateDraft(canonicalInput);
-    draftResult = {
-      ...draftResult,
-      sourceType: "TEMPLATE",
-      permanentLabel: "📄 [Draf Template]",
-      title: tpl.title,
-      body: tpl.body,
-      fallbackReason: "DISABLED",
-      fallbackNotice:
-        "Mode simulasi fallback diaktifkan: sistem otomatis menyusun draf menggunakan format baku.",
-    };
-  }
+  // Explicit template requests bypass the AI client entirely.
+  const draftResult = await generateReportDraft(canonicalInput, { useTemplate: options?.forceFallback });
 
   const [savedDraft] = await db
     .insert(reportDrafts)

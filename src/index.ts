@@ -1,3 +1,4 @@
+import { REPORT_DOCUMENT_CSP } from "./services/reportDocument.js";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -5,6 +6,8 @@ import cookieParser from "cookie-parser";
 import rateLimit from "express-rate-limit";
 import { desc, eq } from "drizzle-orm";
 import { env } from "./config/env.js";
+import { buildCorsOptions } from "./config/cors.js";
+import { createAuthRouter, requireRoles, requireTrustedOrigin, agencyScope, agencyReportAccess, assertAgencyReportAccess, AuthError, authFailure } from "./auth.js";
 import { db } from "./db/index.js";
 import { reportAuditLogs } from "./db/schema.js";
 import { computeFactsHash } from "./utils/hash.js";
@@ -30,6 +33,7 @@ import {
   addReportConditionTag,
   submitCommunitySignoff,
   adminVerifyReport,
+  adminCancelVerification,
   adminRejectReport,
   adminMergeDuplicateReport,
   adminToggleBlurReportPhoto,
@@ -51,12 +55,7 @@ import {
 const app = express();
 
 app.use(helmet());
-app.use(
-  cors({
-    origin: [env.FRONTEND_URL, "http://localhost:3000"],
-    credentials: true,
-  })
-);
+app.use(cors(buildCorsOptions(env)));
 app.use(express.json({ limit: "5mb" }));
 app.use(cookieParser());
 
@@ -69,6 +68,13 @@ const apiLimiter = rateLimit({
 app.use(env.API_PREFIX, apiLimiter);
 
 const v1Router = express.Router();
+v1Router.use("/auth", createAuthRouter());
+v1Router.use("/admin", requireRoles("ADMIN", "SUPER_ADMIN"), requireTrustedOrigin);
+v1Router.use("/audit", requireRoles("ADMIN", "SUPER_ADMIN", "AUDITOR"));
+v1Router.use("/agency", requireRoles("ADMIN", "SUPER_ADMIN", "PETUGAS_INSTANSI"), requireTrustedOrigin, agencyScope);
+v1Router.use("/agency/reports/:id", agencyReportAccess);
+v1Router.use("/weather", requireRoles("ADMIN", "SUPER_ADMIN", "AUDITOR", "PETUGAS_INSTANSI"), requireTrustedOrigin);
+v1Router.post("/weather/sync", requireRoles("ADMIN", "SUPER_ADMIN", "PETUGAS_INSTANSI"));
 
 // ============================================================================
 // 1. HEALTH CHECK & GEOCODING / UPLOAD (F1)
@@ -125,11 +131,12 @@ v1Router.post("/geo/validate-point", async (req, res) => {
   }
 
   let nearbyActiveReports: unknown[] = [];
+  let nearbyReportsAvailable = true;
   if (isInsideBogorCity) {
     try {
       nearbyActiveReports = await findNearbyActiveReports(lat, lng, 30);
     } catch {
-      nearbyActiveReports = [];
+      nearbyReportsAvailable = false;
     }
   }
 
@@ -143,11 +150,16 @@ v1Router.post("/geo/validate-point", async (req, res) => {
       subdistrictName,
       suggestedStreetName,
       nearbyActiveReports,
+      nearbyReportsAvailable,
     },
   });
 });
 
-v1Router.post("/uploads/cloudinary-sign", async (req, res) => {
+v1Router.post("/uploads/cloudinary-sign", (req, res, next) => {
+  if (req.body?.registerPhoto && ["AFTER", "BEFORE"].includes(req.body.kind)) {
+    requireRoles("ADMIN", "SUPER_ADMIN", "PETUGAS_INSTANSI")(req, res, () => requireTrustedOrigin(req, res, next));
+  } else next();
+}, async (req, res) => {
   try {
     const body = req.body as {
       registerPhoto?: boolean;
@@ -163,6 +175,10 @@ v1Router.post("/uploads/cloudinary-sign", async (req, res) => {
     };
 
     if (body?.registerPhoto && body.cloudinaryPublicId && body.originalSecureUrl) {
+      if (["AFTER", "BEFORE"].includes(body.kind || "")) {
+        if (!body.reportId || !req.authUser) throw new AuthError(400, "REPORT_REQUIRED", "Pilih laporan terlebih dahulu.");
+        await assertAgencyReportAccess(req.authUser, body.reportId);
+      }
       const photo = await registerUploadedPhoto({
         reportId: body.reportId ?? null,
         kind: body.kind ?? "REPORT",
@@ -173,7 +189,7 @@ v1Router.post("/uploads/cloudinary-sign", async (req, res) => {
         exifLat: body.exifLat,
         exifLng: body.exifLng,
         exifTakenAt: body.exifTakenAt,
-        uploadedByActor: String(req.headers["x-device-id"] || "warga_pelapor"),
+        uploadedByActor: req.authUser?.id || String(req.headers["x-device-id"] || "warga_pelapor"),
       });
 
       res.json({ success: true, data: { photo } });
@@ -183,6 +199,7 @@ v1Router.post("/uploads/cloudinary-sign", async (req, res) => {
     const sig = generateCloudinaryUploadSignature();
     res.json({ success: true, data: sig });
   } catch (err) {
+    if (err instanceof AuthError) { authFailure(res, err); return; }
     res.status(500).json({
       success: false,
       error: {
@@ -243,7 +260,8 @@ v1Router.put("/reports/:id/facts", async (req, res) => {
 
 v1Router.post("/reports/:id/drafts/generate", async (req, res) => {
   try {
-    const forceFallback = Boolean(req.body?.forceFallback);
+    // Citizen reports use the deterministic template; image assistance is separate future work.
+    const forceFallback = true;
     const draft = await generateAndSaveReportDraft(req.params.id, {
       forceFallback,
       rawIp: req.ip,
@@ -431,7 +449,6 @@ v1Router.post("/auth/otp/request", async (req, res) => {
     success: true,
     data: {
       ...result,
-      devOtpCode: result.demoOtpHint,
     },
   });
 });
@@ -609,6 +626,13 @@ v1Router.post("/admin/reports/:id/verify", async (req, res) => {
   }
 });
 
+v1Router.post("/admin/reports/:id/cancel-verification", async (req, res) => {
+  try {
+    const result = await adminCancelVerification(req.params.id, req.body?.reason, req.ip);
+    res.json({ success: true, data: result });
+  } catch (error) { authFailure(res, error); }
+});
+
 v1Router.post("/admin/reports/:id/reject", async (req, res) => {
   try {
     const { reason, reasonCode, note, reasonDetail } = req.body as {
@@ -643,7 +667,8 @@ v1Router.post("/admin/reports/:id/merge", async (req, res) => {
       parentTicketCode?: string;
       masterTicketCode?: string;
     };
-    const targetCode = parentTicketCode || masterTicketCode || "SJG-2026-1042";
+    const targetCode = parentTicketCode || masterTicketCode;
+    if (!targetCode) throw new Error("Kode tiket induk wajib diisi.");
     const result = await adminMergeDuplicateReport(req.params.id, targetCode, req.ip);
     res.json({
       success: true,
@@ -705,7 +730,7 @@ v1Router.post("/admin/reports/:id/escalate", async (req, res) => {
       data: {
         ...result,
         sentViaResend: result.deliveryStatus === "SENT",
-        messageId: result.providerMessageId || "sim-resend-msg",
+        messageId: result.providerMessageId || "",
       },
     });
   } catch (err) {
@@ -765,7 +790,7 @@ v1Router.get("/audit/logs", async (_req, res) => {
 // ============================================================================
 v1Router.get("/agency/reports", async (req, res) => {
   try {
-    const agencyCode = req.query.agencyCode ? String(req.query.agencyCode) : undefined;
+    const agencyCode = req.authUser?.role === "PETUGAS_INSTANSI" ? req.authUser.agencyCode! : req.query.agencyCode ? String(req.query.agencyCode) : undefined;
     const rows = await listEnrichedReports({
       publicOnly: false,
       agencyCode,
@@ -912,11 +937,13 @@ v1Router.get("/public/reports/:id/document", async (req, res) => {
       res.status(404).send("<h1>Laporan tidak ditemukan</h1>");
       return;
     }
+    res.setHeader("Content-Security-Policy", REPORT_DOCUMENT_CSP);
+    res.setHeader("Cache-Control", "no-store");
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.send(html);
   } catch (err) {
     res.status(500).send(
-      `<h1>Gagal membuat dokumen laporan: ${err instanceof Error ? err.message : "Error"}</h1>`
+      "<h1>Dokumen laporan belum dapat dibuat. Silakan coba lagi.</h1>"
     );
   }
 });
@@ -930,12 +957,12 @@ v1Router.post("/drafts/preview", async (req, res) => {
     sizeWidthCm: facts.sizeWidthCm ?? null,
     sizeDepthCm: facts.sizeDepthCm ?? null,
     landmark: facts.landmark ?? "Jl. Ir. H. Juanda, Kota Bogor",
-    observedAt: facts.observedAt ?? new Date().toISOString(),
+    observedAt: facts.observedAt ?? null,
     impactTags: Array.isArray(facts.impactTags) ? facts.impactTags : ["MEMBAHAYAKAN_RODA_DUA"],
     freeText: facts.freeText ?? "",
     lat: facts.lat ?? -6.5971469,
     lng: facts.lng ?? 106.8060388,
-    photoIds: Array.isArray(facts.photoIds) ? facts.photoIds : ["demo-photo-1"],
+    photoIds: Array.isArray(facts.photoIds) ? facts.photoIds : [],
   };
 
   const factsHash = computeFactsHash(canonical);

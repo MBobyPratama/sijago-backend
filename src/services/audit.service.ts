@@ -40,8 +40,8 @@ export interface WriteAuditLogInput {
  * Menulis entri ke tabel `report_audit_logs` (append-only) lengkap dengan perhitungan
  * `prev_entry_hash` dan `entry_hash` (FR-7.1, FR-7.2, FR-7.5).
  */
-export async function appendAuditLog(input: WriteAuditLogInput) {
-  const lastLog = await db
+export async function appendAuditLog(input: WriteAuditLogInput, executor: Pick<typeof db, "select" | "insert"> = db) {
+  const lastLog = await executor
     .select({ entryHash: reportAuditLogs.entryHash })
     .from(reportAuditLogs)
     .orderBy(desc(reportAuditLogs.id))
@@ -62,7 +62,7 @@ export async function appendAuditLog(input: WriteAuditLogInput) {
 
   const ipHash = hashWithSalt(input.rawIp || "127.0.0.1");
 
-  const [inserted] = await db
+  const [inserted] = await executor
     .insert(reportAuditLogs)
     .values({
       occurredAt: now,

@@ -163,6 +163,16 @@ export const users = pgTable("users", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
+export const authSessions = pgTable("auth_sessions", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  tokenHash: varchar("token_hash", { length: 64 }).notNull().unique(),
+  credentialFingerprint: varchar("credential_fingerprint", { length: 64 }).notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
 // ============================================================================
 // 4. TABEL INTI LAPORAN, VERSI FAKTA, FOTO, DRAF AI, & PERSETUJUAN
 // ============================================================================
@@ -237,7 +247,7 @@ export const reportFactVersions = pgTable(
     sizeClass: damageSizeClassEnum("size_class").notNull(),
 
     landmark: text("landmark").notNull(),
-    observedAt: timestamp("observed_at", { withTimezone: true }).notNull(),
+    observedAt: timestamp("observed_at", { withTimezone: true }),
     impactTags: jsonb("impact_tags").$type<string[]>().default([]).notNull(),
     freeText: varchar("free_text", { length: 1000 }),
 
