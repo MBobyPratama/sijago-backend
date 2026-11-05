@@ -211,6 +211,8 @@ export const reports = pgTable(
     isRecurrentHotspot: boolean("is_recurrent_hotspot").default(false).notNull(),
 
     submittedAt: timestamp("submitted_at", { withTimezone: true }),
+    receiptEmailTo: varchar("receipt_email_to", { length: 255 }),
+    receiptEmailStatus: varchar("receipt_email_status", { length: 20 }),
     verifiedAt: timestamp("verified_at", { withTimezone: true }),
     forwardedAt: timestamp("forwarded_at", { withTimezone: true }),
     inProgressAt: timestamp("in_progress_at", { withTimezone: true }),

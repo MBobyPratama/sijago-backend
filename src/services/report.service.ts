@@ -13,6 +13,7 @@ import {
 import { computeFactsHash, hashWithSalt } from "../utils/hash.js";
 import { generateReportDraft } from "./aiDraft.service.js";
 import { appendAuditLog } from "./audit.service.js";
+import { sendTicketReceiptEmail } from "./email.service.js";
 
 /**
  * Menentukan Kecamatan di Kota Bogor berdasarkan titik koordinat GPS terdekat.
@@ -145,6 +146,7 @@ function validateReportFacts(payload: SaveReportFactsPayload) {
   if (!["KECIL", "SEDANG", "BESAR"].includes(payload.sizeClass)) throw new Error("Pilih kelas ukuran kecil, sedang, atau besar.");
   if (payload.observedAt && (!Number.isFinite(Date.parse(payload.observedAt)) || Date.parse(payload.observedAt) > Date.now())) throw new Error("Waktu pengamatan tidak valid atau berada di masa depan.");
   if (!payload.landmark?.trim()) throw new Error("Patokan lokasi wajib diisi.");
+  if (payload.contactEmail != null && (typeof payload.contactEmail !== "string" || (payload.contactEmail.trim() && (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payload.contactEmail.trim()) || payload.contactEmail.trim().length > 255)))) throw new Error("Alamat email tidak valid. Periksa kembali atau kosongkan email opsional.");
   if (!Number.isFinite(payload.lat) || !Number.isFinite(payload.lng)) throw new Error("Koordinat lokasi tidak valid.");
   if (!Array.isArray(payload.photoIds) || payload.photoIds.length === 0) throw new Error("Tambahkan foto kerusakan terlebih dahulu.");
   for (const value of [payload.sizeLengthCm, payload.sizeWidthCm, payload.sizeDepthCm]) {
@@ -213,6 +215,7 @@ export async function createDraftReportWithFacts(payload: SaveReportFactsPayload
       ticketCode,
       trackingToken,
       reporterId: reporter.id,
+      receiptEmailTo: payload.contactEmail?.trim().toLowerCase() || null,
       status: "DRAFT",
       location: { lng: payload.lng, lat: payload.lat },
       lat: String(payload.lat),
@@ -323,6 +326,7 @@ export async function updateReportFactsAndInvalidateApproval(
     photoIds,
   });
 
+  await tx.update(reports).set({ receiptEmailTo: payload.contactEmail?.trim().toLowerCase() || null }).where(eq(reports.id, reportId));
   const hashChanged = newFactsHash !== existingReport[0].currentFactsHash;
   const { districtName, subdistrictName } = resolveBogorDistrict(payload.lat, payload.lng);
 
@@ -572,74 +576,34 @@ export async function approveReportDraft(params: {
  * Menolak dengan 409 Conflict bila `approvedFactsHash !== current_facts_hash`.
  */
 export async function submitReportFinal(params: {
-  reportId: string;
-  draftId: string;
-  approvedFactsHash: string;
-  idempotencyKey?: string;
-  rawIp?: string;
-}) {
-  const [report] = await db
-    .select()
-    .from(reports)
-    .where(eq(reports.id, params.reportId))
-    .limit(1);
-
-  if (!report) throw new Error("REPORT_NOT_FOUND");
-
-  // Idempotency check (US-06 / E-04)
-  if (report.status !== "DRAFT" && report.idempotencyKey === params.idempotencyKey) {
-    return {
-      reportId: report.id,
-      ticketCode: report.ticketCode,
-      trackingToken: report.trackingToken,
-      status: report.status,
-      submittedAt: report.submittedAt,
-      idempotentReplay: true,
-    };
-  }
-
-  // Penegakan Server FR-3.5: Tolak 409 jika hash fakta tidak cocok!
-  if (report.currentFactsHash !== params.approvedFactsHash) {
-    const err = new Error("APPROVAL_HASH_MISMATCH") as Error & { status?: number };
-    err.status = 409;
-    throw err;
-  }
-
-  const submittedAt = new Date();
-  await db
-    .update(reports)
-    .set({
-      status: "MENUNGGU_VERIFIKASI",
-      approvedDraftId: params.draftId,
-      submittedAt,
-      idempotencyKey: params.idempotencyKey ?? `idem_${report.id}`,
-      updatedAt: submittedAt,
-    })
-    .where(eq(reports.id, report.id));
-
-  await appendAuditLog({
-    reportId: report.id,
-    actorId: "warga_pelapor",
-    actorType: "WARGA_PSEUDONIM",
-    actionType: "REPORT_SUBMITTED",
-    snapshotBefore: { status: "DRAFT" },
-    snapshotAfter: {
-      status: "MENUNGGU_VERIFIKASI",
-      ticketCode: report.ticketCode,
-      approvedFactsHash: params.approvedFactsHash,
-      draftId: params.draftId,
-    },
-    rawIp: params.rawIp,
+  reportId: string; draftId: string; approvedFactsHash: string; idempotencyKey?: string; rawIp?: string;
+}, sendReceipt = sendTicketReceiptEmail) {
+  const result = await db.transaction(async tx => {
+    const [report] = await tx.select().from(reports).where(eq(reports.id, params.reportId)).for("update");
+    if (!report) throw new Error("REPORT_NOT_FOUND");
+    const key = params.idempotencyKey ?? `idem_${report.id}`;
+    if (report.status !== "DRAFT") {
+      if (report.idempotencyKey !== key) throw new Error("Laporan sudah dikirim. Gunakan tiket untuk melacak statusnya.");
+      return { report, replay: true };
+    }
+    if (report.currentFactsHash !== params.approvedFactsHash) throw Object.assign(new Error("APPROVAL_HASH_MISMATCH"), { status: 409 });
+    const [approval] = await tx.select().from(reportApprovals).where(and(eq(reportApprovals.reportId, report.id), eq(reportApprovals.draftId, params.draftId), eq(reportApprovals.approvedFactsHash, params.approvedFactsHash), eq(reportApprovals.isValid, true))).limit(1);
+    const [draft] = await tx.select().from(reportDrafts).where(and(eq(reportDrafts.id, params.draftId), eq(reportDrafts.reportId, report.id), eq(reportDrafts.factsHash, params.approvedFactsHash), eq(reportDrafts.isStale, false))).limit(1);
+    if (!approval || !draft) throw Object.assign(new Error("APPROVAL_HASH_MISMATCH"), { status: 409 });
+    const submittedAt = new Date();
+    const [saved] = await tx.update(reports).set({ status: "MENUNGGU_VERIFIKASI", approvedDraftId: params.draftId, submittedAt, idempotencyKey: key, updatedAt: submittedAt, receiptEmailStatus: report.receiptEmailTo ? "PENDING" : "NOT_REQUESTED" }).where(eq(reports.id, report.id)).returning();
+    await appendAuditLog({ reportId: report.id, actorId: "warga_pelapor", actorType: "WARGA_PSEUDONIM", actionType: "REPORT_SUBMITTED", snapshotBefore: { status: "DRAFT" }, snapshotAfter: { status: saved.status, ticketCode: report.ticketCode, approvedFactsHash: params.approvedFactsHash, draftId: params.draftId }, rawIp: params.rawIp }, tx);
+    return { report: saved, replay: false };
   });
-
-  return {
-    reportId: report.id,
-    ticketCode: report.ticketCode,
-    trackingToken: report.trackingToken,
-    status: "MENUNGGU_VERIFIKASI",
-    submittedAt,
-    idempotentReplay: false,
-  };
+  const report = result.report;
+  let receiptEmailStatus = report.receiptEmailStatus || "NOT_REQUESTED";
+  if (!result.replay && report.receiptEmailTo) {
+    try { receiptEmailStatus = await sendReceipt({ reportId: report.id, ticketCode: report.ticketCode, email: report.receiptEmailTo }); }
+    catch { receiptEmailStatus = "FAILED"; }
+    try { await db.update(reports).set({ receiptEmailStatus }).where(eq(reports.id, report.id)); }
+    catch { /* A mail-status failure must never hide an already committed report. */ }
+  }
+  return { reportId: report.id, ticketCode: report.ticketCode, trackingToken: report.trackingToken, status: report.status, submittedAt: report.submittedAt, idempotentReplay: result.replay, receiptEmailStatus };
 }
 
 /**
