@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createHash } from "node:crypto";
+import { buildReportDescription, descriptionToHtml } from "../utils/reportDescription.js";
 
 interface DocumentReport {
   ticketCode: string; title: string; body: string; status: string;
@@ -40,7 +41,7 @@ main{max-width:210mm;margin:0 auto 24px;background:white;padding:17mm 18mm 18mm}
 </style></head><body>
 <div class="toolbar"><p>Pilih ukuran kertas A4 dan skala 100% saat mencetak.</p><button id="print-document" type="button">Cetak / Simpan PDF</button></div>
 <main><header><div class="brand">SIJAGO<small>Sistem Jalan Bogor</small></div><h1>Lembar laporan kerusakan jalan</h1><div class="ticket"><strong>${escapeHtml(rep.ticketCode)}</strong><span>Status: ${escapeHtml(STATUS[rep.status] ?? rep.status)}</span></div></header>
-<section aria-labelledby="summary"><h2 id="summary">01 / Ringkasan laporan</h2><h3>${escapeHtml(rep.title)}</h3><p class="narrative">${escapeHtml(rep.body || "Ringkasan belum tersedia.")}</p></section>
+<section aria-labelledby="summary"><h2 id="summary">01 / Ringkasan laporan</h2><h3>${escapeHtml(rep.title)}</h3>${descriptionToHtml(buildReportDescription(rep))}</section>
 <section aria-labelledby="facts"><h2 id="facts">02 / Data dan lokasi pengamatan</h2><table><tbody>
 ${row("Kategori kerusakan", CATEGORY[rep.category] ?? rep.category)}
 ${row("Kelas ukuran", `${rep.sizeClass.toLowerCase()} (perkiraan warga)`)}

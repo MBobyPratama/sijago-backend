@@ -1,0 +1,26 @@
+import assert from "node:assert/strict";
+import { buildReportDescription, descriptionToText, descriptionToHtml } from "../src/utils/reportDescription.js";
+import { buildDeterministicTemplateDraft } from "../src/services/aiDraft.service.js";
+import { renderReportDocument } from "../src/services/reportDocument.js";
+import { buildOfficialEscalationMessage } from "../src/services/email.service.js";
+
+const facts = { category: "LUBANG", sizeClass: "BESAR", landmark: "Depan sekolah", observedAt: "2026-11-09T00:00:00Z", freeText: "Lubang tertutup air.\nPengendara perlu berhati-hati.", impactTags: [] as string[], lat: -6.59, lng: 106.8, photoIds: [] as string[] };
+const description = buildReportDescription(facts);
+assert.deepEqual(description.items.map(item => item.label), ["Lokasi", "Kategori kerusakan", "Kelas ukuran", "Waktu pengamatan"]);
+assert(description.items[3].value.includes("07.00") && description.items[3].value.endsWith("WIB"));
+assert.equal(description.condition, facts.freeText);
+const template = buildDeterministicTemplateDraft(facts);
+assert.equal(template.body, descriptionToText(description));
+assert(template.body.startsWith("- Lokasi:")); assert(template.body.includes("\n- Kategori kerusakan:"));
+const long = { ...facts, landmark: "Lokasi ".repeat(250), freeText: "Kondisi ".repeat(250) };
+const shortened = buildDeterministicTemplateDraft(long);
+assert(shortened.body.length <= 600); assert(shortened.notice);
+assert.equal(buildReportDescription(long).condition, long.freeText.trim());
+assert.equal(buildReportDescription({ ...facts, observedAt: null, freeText: " " }).items[3].value, "Tidak diisi");
+const hostile = buildReportDescription({ ...facts, landmark: '<img src=x onerror="alert(1)">', freeText: "<script>alert(1)</script>" });
+assert(!descriptionToHtml(hostile).includes("<script>")); assert(descriptionToHtml(hostile).includes("&lt;img"));
+const doc = renderReportDocument({ ...facts, ticketCode: "SJG-TEST", title: "Laporan uji", body: "Paragraf draf lama", status: "TERVERIFIKASI", dimensionsCm: "Kelas besar", districtName: "Bogor Tengah", subdistrictName: "Paledang", locationSource: "MANUAL_PIN", assignedAgency: null, upvotes: 0, priorityScore: 85, createdAtIso: facts.observedAt, submittedAt: facts.observedAt }, "https://example.test");
+assert(doc.includes("<li><strong>Lokasi:</strong>")); assert(!doc.includes("Paragraf draf lama"));
+const email = await buildOfficialEscalationMessage({ ticketCode: "SJG-TEST", title: "Uji", body: "Paragraf draf lama", description, agencyName: "Instansi uji", recipientEmails: [], permanentLabel: "", districtName: "Bogor Tengah", landmark: facts.landmark, lat: facts.lat, lng: facts.lng });
+assert(email.bodySnapshot.includes("- Kelas ukuran:")); assert(!email.bodySnapshot.includes("Paragraf draf lama"));
+console.log("PASS: structured template, preserved conditions, WIB time, length limits, missing values, safe HTML, legacy PDF rendering and email snapshot. No database writes or emails sent.");

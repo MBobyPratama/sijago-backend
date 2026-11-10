@@ -4,6 +4,7 @@ import cookieParser from "cookie-parser";
 import { createAuthService, hashSessionToken, type AuthRepository, type LoginRecord, type SessionRecord } from "../src/services/auth.service.js";
 import { authorizeRoles, createAuthRouter, agencyScope } from "../src/auth.js";
 import { authContext } from "../src/auth-context.js";
+import { ADMIN_PORTAL_ROLES, AGENCY_PORTAL_ROLES } from "../src/access-policy.js";
 
 // Entirely in memory: never creates accounts, sessions, or reports in Neon.
 const user: LoginRecord = { id: "test-admin", email: "admin@example.test", fullName: "Test Admin", role: "ADMIN", passwordHash: "test-hash", isActive: true, mfaEnabled: false, agencyId: null, agencyCode: null, agencyName: null, agencyActive: null };
@@ -47,8 +48,9 @@ user.agencyActive = true;
 const app = express();
 app.use(express.json(), cookieParser());
 app.use("/auth", createAuthRouter(service));
-app.get("/admin", authorizeRoles(service, "ADMIN"), (_req, res) => res.json({ actor: authContext.getStore()?.id }));
-app.post("/agency", authorizeRoles(service, "PETUGAS_INSTANSI"), agencyScope, (req, res) => res.json(req.body));
+app.get("/admin", authorizeRoles(service, ...ADMIN_PORTAL_ROLES), (_req, res) => res.json({ actor: authContext.getStore()?.id }));
+app.post("/agency", authorizeRoles(service, ...AGENCY_PORTAL_ROLES), agencyScope, (req, res) => res.json(req.body));
+app.get("/weather", authorizeRoles(service, ...AGENCY_PORTAL_ROLES), (_req, res) => res.json({ success: true }));
 const server = app.listen(0, "127.0.0.1");
 await new Promise<void>(resolve => server.once("listening", resolve));
 const address = server.address();
@@ -73,6 +75,15 @@ try {
   user.role = "ADMIN";
   const adminResponse = await fetch(`${base}/admin`, { headers });
   assert.equal((await adminResponse.json()).actor, user.id);
+  for (const role of ["ADMIN", "SUPER_ADMIN", "AUDITOR"] as const) {
+    user.role = role;
+    assert.equal((await fetch(`${base}/agency`, { method: "POST", headers, body: "{}" })).status, 403);
+    assert.equal((await fetch(`${base}/weather`, { headers })).status, 403);
+    assert.equal((await fetch(`${base}/admin`, { headers })).status, role === "AUDITOR" ? 403 : 200);
+  }
+  user.role = "PETUGAS_INSTANSI";
+  assert.equal((await fetch(`${base}/admin`, { headers })).status, 403);
+  assert.equal((await fetch(`${base}/weather`, { headers })).status, 200);
   assert.equal((await fetch(`${base}/auth/logout`, { method: "POST", headers })).status, 200);
   assert.equal((await fetch(`${base}/auth/me`, { headers })).status, 401);
   console.log("PASS: credentials, account state, session rotation/expiry/revocation, roles, agency scope, CSRF origin, cookies and audit actor.");

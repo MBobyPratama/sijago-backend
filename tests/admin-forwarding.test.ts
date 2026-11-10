@@ -1,0 +1,71 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { and, eq } from "drizzle-orm";
+import { db, pool } from "../src/db/index.js";
+import { reports, reporters, users, agencies, escalations, reportAuditLogs, adminNotes } from "../src/db/schema.js";
+import { authContext } from "../src/auth-context.js";
+import { createAdminForwardingService } from "../src/services/adminForwarding.service.js";
+import { toPublicReport } from "../src/utils/publicReport.js";
+
+const rollback = new Error("ROLLBACK_FORWARDING_TEST");
+try {
+  await assert.rejects(db.transaction(async tx => {
+    const suffix = randomUUID().slice(0, 8);
+    const [admin] = await tx.insert(users).values({ email: `forward-${suffix}@example.test`, fullName: "Test admin", passwordHash: "unusable-test-password", role: "ADMIN" }).returning();
+    const [agency] = await tx.insert(agencies).values({ code: `TEST_${suffix}`, name: "Test agency", level: "KOTA", officialEmails: ["agency@example.test"] }).returning();
+    const [reporter] = await tx.insert(reporters).values({ pseudonymId: `forward-${suffix}`, deviceHash: "test" }).returning();
+    const fixture = async (tag: string) => (await tx.insert(reports).values({ ticketCode: `FWD-${suffix}-${tag}`, trackingToken: randomUUID(), reporterId: reporter.id, location: { lat: -6.59, lng: 106.8 }, lat: "-6.59", lng: "106.8", currentFactsHash: "a".repeat(64), status: "MENUNGGU_VERIFIKASI" }).returning())[0];
+    const report = await fixture("A"), other = await fixture("B");
+    let sends = 0, fail = true;
+    const sender = async (message: { escalationId: string }) => {
+      sends++;
+      const [record] = await tx.select().from(escalations).where(eq(escalations.id, message.escalationId));
+      const [assigned] = await tx.select().from(reports).where(eq(reports.id, record.reportId));
+      assert.equal(assigned.status, "DITERUSKAN");
+      assert.equal(assigned.assignedAgencyId, agency.id);
+      return { success: !fail, providerMessageId: fail ? null : "test-message", failureReason: fail ? "Test mail failure" : null };
+    };
+    const service = createAdminForwardingService(tx, sender);
+    const input = { reportIdOrCode: report.id, agencyCode: agency.code, adminNoteText: "Internal test note" };
+    await assert.rejects(service.forward(input), { code: "ADMIN_REQUIRED" });
+    await authContext.run({ id: admin.id, email: admin.email, fullName: admin.fullName, role: "ADMIN", agencyId: null, agencyCode: null, agencyName: null }, async () => {
+      const result = await service.verifyAndForward(input);
+      assert.equal(result.assignmentFailed, false);
+      assert.equal(result.status, "DITERUSKAN");
+      assert.equal("deliveryStatus" in result && result.deliveryStatus, "FAILED");
+      assert.equal(sends, 1);
+      await service.verifyAndForward(input);
+      assert.equal(sends, 1, "repeat confirmation must not resend or reassign");
+      const [record] = await tx.select().from(escalations).where(eq(escalations.reportId, report.id));
+      fail = false;
+      const retry = await service.retryEmail(report.id, record.id);
+      assert.equal(retry.deliveryStatus, "SENT");
+      assert.equal(sends, 2);
+      await service.retryEmail(report.id, record.id);
+      assert.equal(sends, 2, "a successful email cannot be sent again");
+      const events = await tx.select().from(reportAuditLogs).where(eq(reportAuditLogs.reportId, report.id));
+      for (const action of ["VERIFY_REPORT", "ROUTE_ASSIGNED", "ESCALATION_EMAIL_FAILED", "ESCALATION_EMAIL_SENT"]) assert.equal(events.filter(event => event.actionType === action).length, 1);
+      assert.equal((await tx.select().from(adminNotes).where(eq(adminNotes.reportId, report.id))).length, 1);
+      assert.equal((await tx.select().from(escalations).where(eq(escalations.reportId, report.id))).length, 1);
+      const partial = await service.verifyAndForward({ ...input, reportIdOrCode: other.id, agencyCode: "MISSING_TEST_AGENCY" });
+      assert.equal(partial.assignmentFailed, true);
+      assert.equal(partial.status, "TERVERIFIKASI");
+      const [stillVerified] = await tx.select().from(reports).where(eq(reports.id, other.id));
+      assert.ok(stillVerified.verifiedAt);
+      await service.forward({ ...input, reportIdOrCode: other.id });
+      assert.equal((await tx.select().from(reportAuditLogs).where(and(eq(reportAuditLogs.reportId, other.id), eq(reportAuditLogs.actionType, "VERIFY_REPORT")))).length, 1);
+      await tx.update(escalations).set({ deliveryStatus: "QUEUED", updatedAt: new Date() }).where(eq(escalations.id, record.id));
+      await assert.rejects(service.retryEmail(report.id, record.id), /sedang diproses/);
+      await tx.update(escalations).set({ updatedAt: new Date(Date.now() - 180000) }).where(eq(escalations.id, record.id));
+      await tx.update(agencies).set({ officialEmails: ["updated-agency@example.test"] }).where(eq(agencies.id, agency.id));
+      await service.retryEmail(report.id, record.id);
+      const [retried] = await tx.select().from(escalations).where(eq(escalations.id, record.id));
+      assert.deepEqual(retried.recipientEmails, ["updated-agency@example.test"]);
+      await assert.rejects(service.retryEmail(other.id, record.id), /Penugasan sudah berubah/);
+      const publicData = toPublicReport({ adminNotes: ["secret"], escalationEmail: { failureReason: "internal" }, publicAdminResponse: "Public" });
+      assert.deepEqual(publicData, { publicAdminResponse: "Public" });
+    });
+    throw rollback;
+  }), error => error === rollback);
+  console.log("PASS combined verification/assignment, committed assignment before mail, failed mail preserves status, safe retry without duplicate verification/assignment, separate audits, partial assignment recovery, queued lease, scope and privacy. All fixtures rolled back; no emails sent.");
+} finally { await pool.end(); }

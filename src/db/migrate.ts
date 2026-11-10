@@ -33,6 +33,8 @@ async function runMigrations() {
   await db.execute(sql.raw(fs.readFileSync(path.resolve(process.cwd(), "drizzle/0002_link_report_photos.sql"), "utf-8")));
   await db.execute(sql.raw(fs.readFileSync(path.resolve(process.cwd(), "drizzle/0003_auth_sessions.sql"), "utf-8")));
   await db.execute(sql.raw(fs.readFileSync(path.resolve(process.cwd(), "drizzle/0004_ticket_receipt_email.sql"), "utf-8")));
+  await db.execute(sql.raw(fs.readFileSync(path.resolve(process.cwd(), "drizzle/0005_community_verification.sql"), "utf-8")));
+  await db.execute(sql.raw(fs.readFileSync(path.resolve(process.cwd(), "drizzle/0006_public_admin_response.sql"), "utf-8")));
 
   // Indeks GIST Spasial PostGIS (FR-1.4 & FR-1.9)
   await db.execute(
