@@ -1,3 +1,4 @@
+import { buildReportDescription, descriptionToText } from "../utils/reportDescription.js";
 import OpenAI from "openai";
 import { env } from "../config/env.js";
 import { CanonicalFactInput } from "../utils/hash.js";
@@ -33,7 +34,7 @@ export interface DraftGenerationOutput {
   latencyMs: number;
 }
 
-const PROMPT_VERSION = "v1.2-factual-template";
+const PROMPT_VERSION = "v1.3-structured-template";
 
 const FORBIDDEN_PATTERNS = [
   /dinas\s+pupr/i,
@@ -56,33 +57,20 @@ export function buildDeterministicTemplateDraft(facts: CanonicalFactInput): {
   const location = facts.landmark.trim();
   const titleBase = `Kerusakan ${category} di ${location}`;
   const title = titleBase.length <= 80 ? titleBase : titleBase.slice(0, 77).replace(/\s+\S*$/, "") + "…";
-  const endSentence = (text: string) => /[.!?]$/.test(text) ? text : `${text}.`;
-  const dimensions = [
-    facts.sizeLengthCm ? `panjang ${facts.sizeLengthCm} cm` : "",
-    facts.sizeWidthCm ? `lebar ${facts.sizeWidthCm} cm` : "",
-    facts.sizeDepthCm ? `kedalaman ${facts.sizeDepthCm} cm` : "",
-  ].filter(Boolean);
-  const sections = [
-    `Dilaporkan kerusakan jalan kategori ${category}.`,
-    endSentence(`Lokasi: ${location}`),
-    `Kelas ukuran ${facts.sizeClass.toLowerCase()} (perkiraan warga).`,
-    ...(dimensions.length ? [`Ukuran yang dilaporkan: ${dimensions.join(", ")}.`] : []),
-    ...(facts.observedAt ? [`Waktu pengamatan: ${new Intl.DateTimeFormat("id-ID", { timeZone: "Asia/Jakarta", day: "2-digit", month: "long", year: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(facts.observedAt))} WIB.`] : []),
-    ...(facts.freeText?.trim() ? [endSentence(`Kondisi di lapangan: ${facts.freeText.trim()}`)] : []),
-    ...(facts.impactTags.length ? [`Dampak yang dilaporkan: ${facts.impactTags.map(tag => tag.replace(/_/g, " ").toLowerCase()).join(", ")}.`] : []),
-  ];
+  const description = buildReportDescription(facts);
+  const fullBody = descriptionToText(description);
   const reminder = "Rincian lengkap tersedia pada Fakta Asal.";
-  let omitted = false;
+  if (fullBody.length <= 600) return { title, body: fullBody, notice: null };
   const included: string[] = [];
-  for (const section of sections) {
-    if ([...included, section].join(" ").length <= 600 - reminder.length - 1) included.push(section);
-    else omitted = true;
+  for (const item of description.items) {
+    const line = `- ${item.label}: ${item.value}`;
+    if ([...included, line, reminder].join("\n").length <= 600) included.push(line);
   }
-  if (omitted) included.push(reminder);
-  return {
-    title, body: included.join(" "),
-    notice: omitted ? "Sebagian rincian tidak dimuat karena batas panjang draf. Baca Fakta Asal lengkap sebelum menyetujui; data asli tetap tersimpan." : null,
-  };
+  if (description.condition) {
+    const condition = `Kondisi di lapangan:\n${description.condition}`;
+    if ([...included, condition, reminder].join("\n\n").length <= 600) included.push(condition);
+  }
+  return { title, body: [...included, reminder].join("\n"), notice: "Sebagian rincian tidak dimuat karena batas panjang draf. Baca Fakta Asal lengkap sebelum menyetujui; data asli tetap tersimpan." };
 }
 
 /**

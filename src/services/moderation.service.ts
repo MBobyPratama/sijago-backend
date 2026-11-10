@@ -1,3 +1,6 @@
+import { CONDITION_TAG_LABELS, presentConditionTags } from "../utils/conditionTags.js";
+import { parsePublicAdminResponse } from "../utils/publicReport.js";
+import { buildReportDescription } from "../utils/reportDescription.js";
 import { AuthError } from "./auth.service.js";
 import { authContext } from "../auth-context.js";
 import { eq, desc, and, ne, sql, inArray } from "drizzle-orm";
@@ -20,7 +23,7 @@ import {
 import { hashWithSalt } from "../utils/hash.js";
 import { appendAuditLog } from "./audit.service.js";
 import { buildStrippedPublicImageUrl } from "./cloudinary.service.js";
-import { sendOfficialEscalationEmail } from "./email.service.js";
+
 
 /**
  * Mengambil admin dari sesi terautentikasi untuk pencatatan moderasi & eskalasi.
@@ -40,18 +43,21 @@ export async function listEnrichedReports(options?: {
   district?: string;
   category?: string;
   agencyCode?: string;
+  reportIds?: string[];
 }) {
+  if (options?.reportIds?.length === 0) return [];
   const allReports = await db
     .select()
     .from(reports)
-    .where(ne(reports.status, "DRAFT"))
+    .where(and(ne(reports.status, "DRAFT"), options?.reportIds ? inArray(reports.id, options.reportIds) : undefined))
     .orderBy(desc(reports.priorityScore), desc(reports.createdAt))
-    .limit(50);
+    .limit(options?.reportIds ? options.reportIds.length : 50);
 
   const allAgencies = await db.select().from(agencies);
   const agencyMap = new Map(allAgencies.map((a) => [a.id, a]));
 
-  const forwardedReports = new Set((await db.select({ reportId: escalations.reportId }).from(escalations)).map(item => item.reportId));
+  const escalationRows = await db.select({ id: escalations.id, reportId: escalations.reportId, agencyId: escalations.agencyId, deliveryStatus: escalations.deliveryStatus, failureReason: escalations.failureReason, updatedAt: escalations.updatedAt }).from(escalations).where(inArray(escalations.reportId, allReports.map(report => report.id))).orderBy(desc(escalations.sentAt));
+  const forwardedReports = new Set(escalationRows.map(item => item.reportId));
   const results = [];
 
   for (const rep of allReports) {
@@ -120,11 +126,7 @@ export async function listEnrichedReports(options?: {
     const mulusCount = signoffRows.filter((s) => s.rating === "MULUS").length;
     const cepatRusakCount = signoffRows.filter((s) => s.rating === "CEPAT_RUSAK").length;
 
-    const TAG_LABELS: Record<string, string> = {
-      TERTUTUP_GENANGAN_AIR: "🌊 Tertutup Genangan Air",
-      RAWAN_PEMOTOR_JATUH: "⚠️ Rawan Pemotor Jatuh",
-      MINIM_PENERANGAN: "🌑 Minim Penerangan Malam",
-    };
+
 
     const dims = [
       fact?.sizeLengthCm != null ? `panjang ${fact.sizeLengthCm} cm` : null,
@@ -132,12 +134,14 @@ export async function listEnrichedReports(options?: {
       fact?.sizeDepthCm != null ? `kedalaman ${fact.sizeDepthCm} cm` : null,
     ].filter(Boolean).join(", ");
 
+    const latestEscalation = escalationRows.find(item => item.reportId === rep.id && item.agencyId === rep.assignedAgencyId);
     results.push({
       id: rep.id,
       ticketCode: rep.ticketCode,
       trackingToken: rep.trackingToken,
       title: draft?.title ?? `[${fact?.category ?? "LUBANG"}] Laporan Kerusakan Jalan`,
       body: draft?.body ?? fact?.freeText ?? "",
+      description: fact ? buildReportDescription(fact) : null,
       draftSource: draft?.sourceType ?? "AI",
       permanentLabel:
         draft?.sourceType === "TEMPLATE" ? "📄 [Draf Template]" : "✨ [Draf Dibantu AI]",
@@ -169,11 +173,7 @@ export async function listEnrichedReports(options?: {
       observedAt: fact?.observedAt?.toISOString() ?? null,
       freeText: fact?.freeText ?? null,
       impactTags: fact?.impactTags ?? [],
-      conditionTags: tagsRows.map((t) => ({
-        code: t.tagCode,
-        label: TAG_LABELS[t.tagCode] ?? t.tagCode,
-        count: Number(t.count),
-      })),
+      conditionTags: presentConditionTags(tagsRows),
       signoffSummary: {
         monitoringDaysLeft: rep.monitoringEndsAt ? Math.max(0, Math.ceil((rep.monitoringEndsAt.getTime() - Date.now()) / 86400000)) : 0,
         mulusCount,
@@ -186,6 +186,8 @@ export async function listEnrichedReports(options?: {
         isBlurredByAdmin: p.isBlurredByAdmin,
       })),
       adminNotes: notes.map((n) => n.note),
+      publicAdminResponse: rep.publicAdminResponse,
+      escalationEmail: latestEscalation ? { id: latestEscalation.id, deliveryStatus: latestEscalation.deliveryStatus, failureReason: latestEscalation.failureReason, canRetry: !rep.returnedByAgency && (["FAILED", "BOUNCED"].includes(latestEscalation.deliveryStatus) || latestEscalation.deliveryStatus === "QUEUED" && Date.now() - latestEscalation.updatedAt.getTime() >= 120000) } : null,
     });
   }
 
@@ -195,11 +197,11 @@ export async function listEnrichedReports(options?: {
 /**
  * Mencari satu laporan berdasarkan ID UUID atau Ticket Code (`SJG-2026-XXXX`).
  */
-export async function findReportByIdOrCode(idOrCode: string) {
+export async function findReportByIdOrCode(idOrCode: string, executor: Pick<typeof db, "select"> = db) {
   const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
     idOrCode
   );
-  const [rep] = await db
+  const [rep] = await executor
     .select()
     .from(reports)
     .where(isUuid ? eq(reports.id, idOrCode) : eq(reports.ticketCode, idOrCode.toUpperCase()))
@@ -267,13 +269,14 @@ export async function addReportConditionTag(params: {
   tagCode: string;
   deviceId: string;
   verifiedEmailHash: string;
-}) {
-  const rep = await findReportByIdOrCode(params.reportIdOrCode);
+}, executor: Pick<typeof db, "select" | "insert"> = db) {
+  if (!CONDITION_TAG_LABELS[params.tagCode]) throw new Error("Tag kondisi tidak valid.");
+  const rep = await findReportByIdOrCode(params.reportIdOrCode, executor);
   if (!rep) throw new Error("REPORT_NOT_FOUND");
 
-  const voterKey = `voter_${hashWithSalt(params.deviceId).slice(0, 16)}`;
+  const voterKey = `verified_${params.verifiedEmailHash}`;
 
-  await db
+  await executor
     .insert(reportConditionTags)
     .values({
       reportId: rep.id,
@@ -283,7 +286,8 @@ export async function addReportConditionTag(params: {
     })
     .onConflictDoNothing();
 
-  return { reportId: rep.id, tagCode: params.tagCode };
+  const tagRows = await executor.select({ tagCode: reportConditionTags.tagCode, count: sql<number>`COUNT(*)::int` }).from(reportConditionTags).where(eq(reportConditionTags.reportId, rep.id)).groupBy(reportConditionTags.tagCode);
+  return { reportId: rep.id, tagCode: params.tagCode, conditionTags: presentConditionTags(tagRows) };
 }
 
 /**
@@ -297,72 +301,85 @@ export async function submitCommunitySignoff(params: {
   comment?: string;
   deviceId: string;
   rawIp?: string;
-}) {
-  const rep = await findReportByIdOrCode(params.reportIdOrCode);
-  if (!rep) throw new Error("REPORT_NOT_FOUND");
+  verifiedEmailHash: string;
+}, database: Pick<typeof db, "select" | "transaction"> = db) {
+  if (!["MULUS", "CEPAT_RUSAK"].includes(params.rating)) throw new Error("Penilaian tidak valid.");
+  if (params.comment != null && (typeof params.comment !== "string" || params.comment.length > 500)) throw new Error("Komentar maksimal 500 karakter.");
+  const report = await findReportByIdOrCode(params.reportIdOrCode, database);
+  if (!report) throw new Error("REPORT_NOT_FOUND");
+  return database.transaction(async tx => {
+    const [rep] = await tx.select().from(reports).where(eq(reports.id, report.id)).for("update");
+    if (!rep) throw new Error("REPORT_NOT_FOUND");
+    if (!["SELESAI", "DIBUKA_KEMBALI"].includes(rep.status) || !rep.monitoringEndsAt || rep.monitoringEndsAt.getTime() <= Date.now()) throw new Error("Penilaian hanya tersedia selama masa pemantauan hasil perbaikan.");
 
-  const voterKey = `voter_${hashWithSalt(params.deviceId)}_${Date.now().toString().slice(-4)}`;
+    const voterKey = `verified_${params.verifiedEmailHash}`;
 
-  await db.insert(signoffs).values({
-    reportId: rep.id,
-    voterKey,
-    rating: params.rating,
-    comment: params.comment ?? null,
-  });
-
-  await appendAuditLog({
-    reportId: rep.id,
-    actorId: voterKey,
-    actorType: "WARGA_PSEUDONIM",
-    actionType: "SIGNOFF_SUBMITTED",
-    snapshotBefore: { status: rep.status },
-    snapshotAfter: { rating: params.rating, comment: params.comment ?? null },
-    rawIp: params.rawIp,
-  });
-
-  const allVotes = await db.select().from(signoffs).where(eq(signoffs.reportId, rep.id));
-  const mulusCount = allVotes.filter((v) => v.rating === "MULUS").length;
-  const cepatRusakCount = allVotes.filter((v) => v.rating === "CEPAT_RUSAK").length;
-  const totalVotes = mulusCount + cepatRusakCount;
-
-  const reopenedTriggered =
-    params.rating === "CEPAT_RUSAK" &&
-    (cepatRusakCount >= 3 || (totalVotes >= 1 && cepatRusakCount / totalVotes > 0.5));
-
-  if (reopenedTriggered && rep.status !== "DIBUKA_KEMBALI") {
-    await db
-      .update(reports)
-      .set({
-        status: "DIBUKA_KEMBALI",
-        reopenedAt: new Date(),
-        isRecurrentHotspot: true,
-        updatedAt: new Date(),
-      })
-      .where(eq(reports.id, rep.id));
+    await tx.insert(signoffs).values({
+      reportId: rep.id,
+      voterKey,
+      rating: params.rating,
+      comment: params.comment ?? null,
+    }).onConflictDoUpdate({ target: [signoffs.reportId, signoffs.voterKey], set: { rating: params.rating, comment: params.comment?.trim() || null, updatedAt: new Date() } });
 
     await appendAuditLog({
       reportId: rep.id,
-      actorId: "system_signoff_threshold",
-      actorType: "SISTEM",
-      actionType: "REOPENED",
+      actorId: voterKey,
+      actorType: "WARGA_PSEUDONIM",
+      actionType: "SIGNOFF_SUBMITTED",
       snapshotBefore: { status: rep.status },
-      snapshotAfter: {
-        status: "DIBUKA_KEMBALI",
-        mulusCount,
-        cepatRusakCount,
-      },
+      snapshotAfter: { rating: params.rating, comment: params.comment ?? null },
       rawIp: params.rawIp,
-    });
-  }
+    }, tx);
 
-  return {
-    reportId: rep.id,
-    ticketCode: rep.ticketCode,
-    mulusCount,
-    cepatRusakCount,
-    reopenedTriggered,
-    newStatus: reopenedTriggered ? "DIBUKA_KEMBALI" : rep.status,
-  };
+    const allVotes = await tx.select().from(signoffs).where(eq(signoffs.reportId, rep.id));
+    const mulusCount = allVotes.filter((v) => v.rating === "MULUS").length;
+    const cepatRusakCount = allVotes.filter((v) => v.rating === "CEPAT_RUSAK").length;
+    const totalVotes = mulusCount + cepatRusakCount;
+
+    const config = await tx.select().from(systemConfig);
+    const configuredMin = Number(config.find(item => item.key === "signoff_reopen_min_votes")?.value ?? 3);
+    const configuredRatio = Number(config.find(item => item.key === "signoff_reopen_bad_ratio")?.value ?? 0.5);
+    const minVotes = Number.isInteger(configuredMin) && configuredMin > 0 ? configuredMin : 3;
+    const ratio = configuredRatio > 0 && configuredRatio <= 1 ? configuredRatio : 0.5;
+    const reopenedTriggered =
+      params.rating === "CEPAT_RUSAK" &&
+      cepatRusakCount >= minVotes && totalVotes > 0 && cepatRusakCount / totalVotes > ratio;
+
+    if (reopenedTriggered && rep.status !== "DIBUKA_KEMBALI") {
+      await tx
+        .update(reports)
+        .set({
+          status: "DIBUKA_KEMBALI",
+          reopenedAt: new Date(),
+          isRecurrentHotspot: true,
+          updatedAt: new Date(),
+        })
+        .where(eq(reports.id, rep.id));
+
+      await appendAuditLog({
+        reportId: rep.id,
+        actorId: "system_signoff_threshold",
+        actorType: "SISTEM",
+        actionType: "REOPENED",
+        snapshotBefore: { status: rep.status },
+        snapshotAfter: {
+          status: "DIBUKA_KEMBALI",
+          mulusCount,
+          cepatRusakCount,
+        },
+        rawIp: params.rawIp,
+      }, tx);
+    }
+
+    return {
+      reportId: rep.id,
+      ticketCode: rep.ticketCode,
+      mulusCount,
+      cepatRusakCount,
+      reopenedTriggered,
+      newStatus: reopenedTriggered ? "DIBUKA_KEMBALI" : rep.status,
+    };
+  });
 }
 
 /**
@@ -413,6 +430,19 @@ export async function adminVerifyReport(
 }
 
 /** Cancel verification atomically, preserving source facts and audit history. */
+export async function savePublicAdminResponse(reportIdOrCode: string, value: unknown, rawIp?: string) {
+  const response = parsePublicAdminResponse(value);
+  const rep = await findReportByIdOrCode(reportIdOrCode);
+  if (!rep) throw new Error("REPORT_NOT_FOUND");
+  const admin = await getAuthenticatedAdminUser();
+  return db.transaction(async tx => {
+    const [current] = await tx.select().from(reports).where(eq(reports.id, rep.id)).for("update");
+    await tx.update(reports).set({ publicAdminResponse: response, updatedAt: new Date() }).where(eq(reports.id, rep.id));
+    await appendAuditLog({ reportId: rep.id, actorId: admin.id, actorType: "ADMIN", actionType: "ADMIN_OVERRIDE", snapshotBefore: { publicAdminResponse: current.publicAdminResponse }, snapshotAfter: { publicAdminResponse: response, operation: "PUBLIC_ADMIN_RESPONSE_UPDATED" }, rawIp }, tx);
+    return { publicAdminResponse: response };
+  });
+}
+
 export async function adminCancelVerification(reportIdOrCode: string, reason: unknown, rawIp?: string) {
   if (typeof reason !== "string" || !reason.trim() || reason.trim().length > 2000) throw new AuthError(400, "INVALID_REASON", "Isi alasan pembatalan, maksimal 2.000 karakter.");
   const admin = await getAuthenticatedAdminUser();
@@ -547,117 +577,6 @@ export async function adminToggleBlurReportPhoto(
   }
 
   return { reportId: rep.id, ticketCode: rep.ticketCode, isBlurredByAdmin: blur };
-}
-
-/**
- * POST /v1/admin/reports/:id/escalate — Admin memilih instansi & menekan konfirmasi kirim email resmi via Resend (FR-5.5 - FR-5.8).
- */
-export async function adminEscalateReportToAgency(params: {
-  reportIdOrCode: string;
-  agencyCode: string;
-  adminNoteText?: string;
-  rawIp?: string;
-}) {
-  const rep = await findReportByIdOrCode(params.reportIdOrCode);
-  if (!rep) throw new Error("REPORT_NOT_FOUND");
-
-  return db.transaction(async tx => {
-    const [current] = await tx.select().from(reports).where(eq(reports.id, rep.id)).for("update");
-    if (!current || !["TERVERIFIKASI", "DIBUKA_KEMBALI"].includes(current.status)) throw new AuthError(409, "INVALID_REPORT_STATUS", "Laporan harus terverifikasi sebelum diteruskan ke instansi.");
-    const [agency] = await tx
-      .select()
-      .from(agencies)
-      .where(eq(agencies.code, params.agencyCode))
-      .limit(1);
-
-    if (!agency) throw new Error("AGENCY_NOT_FOUND");
-    const adminUser = await getAuthenticatedAdminUser();
-
-    const [draft] = await tx
-      .select()
-      .from(reportDrafts)
-      .where(eq(reportDrafts.reportId, rep.id))
-      .orderBy(desc(reportDrafts.createdAt))
-      .limit(1);
-
-    const [fact] = await tx
-      .select()
-      .from(reportFactVersions)
-      .where(eq(reportFactVersions.reportId, rep.id))
-      .orderBy(desc(reportFactVersions.versionNo))
-      .limit(1);
-
-    const permanentLabel =
-      draft?.sourceType === "TEMPLATE" ? "📄 [Draf Template]" : "✨ [Draf Dibantu AI]";
-
-    const emailResult = await sendOfficialEscalationEmail({
-      ticketCode: rep.ticketCode,
-      agencyName: agency.name,
-      recipientEmails: agency.officialEmails,
-      permanentLabel,
-      title: draft?.title ?? `Laporan ${rep.ticketCode}`,
-      body: draft?.body ?? fact?.freeText ?? "",
-      districtName: rep.districtName ?? "Kota Bogor",
-      landmark: fact?.landmark ?? "Kota Bogor",
-      lat: rep.lat,
-      lng: rep.lng,
-      adminNote: params.adminNoteText,
-    });
-
-    const [escalationRecord] = await tx
-      .insert(escalations)
-      .values({
-        reportId: rep.id,
-        agencyId: agency.id,
-        sentByUserId: adminUser.id,
-        recipientEmails: emailResult.sentTo,
-        emailSubject: emailResult.subject,
-        emailBodySnapshot: emailResult.bodySnapshot,
-        providerMessageId: emailResult.providerMessageId,
-        deliveryStatus: emailResult.deliveryStatus,
-        failureReason: emailResult.failureReason,
-      })
-      .returning();
-
-    // Aturan FR-5.7 & FR-5.8: Status berubah ke DITERUSKAN jika pengiriman diterima (atau fallback simulasi)
-    await tx
-      .update(reports)
-      .set({
-        status: "DITERUSKAN",
-        assignedAgencyId: agency.id,
-        forwardedAt: new Date(),
-        returnedByAgency: false,
-        updatedAt: new Date(),
-      })
-      .where(eq(reports.id, rep.id));
-
-    await appendAuditLog({
-      reportId: rep.id,
-      actorId: adminUser.email,
-      actorType: "ADMIN",
-      actionType: emailResult.success ? "ESCALATION_EMAIL_SENT" : "ESCALATION_EMAIL_FAILED",
-      snapshotBefore: { status: rep.status, assignedAgencyId: rep.assignedAgencyId },
-      snapshotAfter: {
-        status: "DITERUSKAN",
-        agencyCode: agency.code,
-        agencyName: agency.name,
-        sentTo: emailResult.sentTo,
-        providerMessageId: emailResult.providerMessageId,
-        deliveryStatus: emailResult.deliveryStatus,
-      },
-      rawIp: params.rawIp,
-    }, tx);
-
-    return {
-      escalationId: escalationRecord.id,
-      ticketCode: rep.ticketCode,
-      agencyName: agency.name,
-      sentTo: emailResult.sentTo,
-      providerMessageId: emailResult.providerMessageId,
-      deliveryStatus: emailResult.deliveryStatus,
-      newStatus: "DITERUSKAN",
-    };
-  });
 }
 
 /**

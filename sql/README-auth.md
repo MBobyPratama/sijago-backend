@@ -6,7 +6,7 @@ Buka `create-portal-account.sql` di SQL Editor Neon pada database SIJAGO.
 2. Pada bagian 2, isi `v_email`, `v_full_name`, dan `v_password` dengan nilai Anda sendiri.
 3. Untuk admin gunakan `v_role := 'ADMIN'` dan `v_agency_code := NULL`. Untuk petugas gunakan `v_role := 'PETUGAS_INSTANSI'` dan kode instansi yang tampil pada bagian 3.
 4. Jalankan blok `DO` satu kali per akun, menggunakan email dan kata sandi yang berbeda. Email duplikat menghasilkan error; tidak ada penggantian kata sandi diam-diam.
-5. Masuk melalui `/login`. Admin menuju moderasi, petugas menuju laporan instansinya. `SUPER_ADMIN` memiliki akses admin; `AUDITOR` hanya dapat membaca audit dan ringkasan cuaca.
+5. Masuk melalui `/login`. Admin menuju moderasi, petugas menuju laporan instansinya. `SUPER_ADMIN` memiliki akses admin; `AUDITOR` hanya dapat membaca audit. Akun admin tidak dapat membuka portal/API instansi, dan akun petugas instansi tidak dapat membuka portal/API admin.
 
 Kata sandi di-hash dengan pgcrypto bcrypt, biaya 12; gunakan 12 karakter atau lebih, maksimal 72 byte UTF-8. Jangan membagikan query yang sudah diisi kata sandi. Tidak ada akun atau kata sandi bawaan di seeding.
 

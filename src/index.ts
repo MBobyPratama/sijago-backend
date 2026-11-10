@@ -1,4 +1,10 @@
 import { REPORT_DOCUMENT_CSP } from "./services/reportDocument.js";
+import { adminForwarding } from "./services/adminForwarding.service.js";
+import { toPublicReport } from "./utils/publicReport.js";
+import { adminQueueQuery, listAdminQueue, listMergeCandidates } from "./services/adminQueue.service.js";
+import { savePublicAdminResponse } from "./services/moderation.service.js";
+import { z } from "zod";
+import { exportAuditLogs } from "./services/auditExport.service.js";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -7,9 +13,10 @@ import rateLimit from "express-rate-limit";
 import { desc, eq } from "drizzle-orm";
 import { env } from "./config/env.js";
 import { buildCorsOptions } from "./config/cors.js";
+import { ADMIN_PORTAL_ROLES, AGENCY_PORTAL_ROLES } from "./access-policy.js";
 import { createAuthRouter, requireRoles, requireTrustedOrigin, agencyScope, agencyReportAccess, assertAgencyReportAccess, AuthError, authFailure } from "./auth.js";
 import { db } from "./db/index.js";
-import { reportAuditLogs } from "./db/schema.js";
+import { reportAuditLogs, agencies } from "./db/schema.js";
 import { computeFactsHash } from "./utils/hash.js";
 import { generateReportDraft } from "./services/aiDraft.service.js";
 import {
@@ -26,7 +33,7 @@ import {
   submitReportFinal,
   getReportTrackingDetails,
 } from "./services/report.service.js";
-import { requestEmailOtp, verifyEmailOtp } from "./services/email.service.js";
+import { createCommunityOtpRouter, authorizeCommunity } from "./community-verification.js";
 import {
   listEnrichedReports,
   toggleReportUpvote,
@@ -37,7 +44,6 @@ import {
   adminRejectReport,
   adminMergeDuplicateReport,
   adminToggleBlurReportPhoto,
-  adminEscalateReportToAgency,
   agencyUpdateReportStatus,
   agencyReturnReportToAdmin,
   getSystemConfigs,
@@ -69,12 +75,12 @@ app.use(env.API_PREFIX, apiLimiter);
 
 const v1Router = express.Router();
 v1Router.use("/auth", createAuthRouter());
-v1Router.use("/admin", requireRoles("ADMIN", "SUPER_ADMIN"), requireTrustedOrigin);
+v1Router.use("/auth/otp", createCommunityOtpRouter());
+v1Router.use("/admin", requireRoles(...ADMIN_PORTAL_ROLES), requireTrustedOrigin);
 v1Router.use("/audit", requireRoles("ADMIN", "SUPER_ADMIN", "AUDITOR"));
-v1Router.use("/agency", requireRoles("ADMIN", "SUPER_ADMIN", "PETUGAS_INSTANSI"), requireTrustedOrigin, agencyScope);
+v1Router.use("/agency", requireRoles(...AGENCY_PORTAL_ROLES), requireTrustedOrigin, agencyScope);
 v1Router.use("/agency/reports/:id", agencyReportAccess);
-v1Router.use("/weather", requireRoles("ADMIN", "SUPER_ADMIN", "AUDITOR", "PETUGAS_INSTANSI"), requireTrustedOrigin);
-v1Router.post("/weather/sync", requireRoles("ADMIN", "SUPER_ADMIN", "PETUGAS_INSTANSI"));
+v1Router.use("/weather", requireRoles(...AGENCY_PORTAL_ROLES), requireTrustedOrigin);
 
 // ============================================================================
 // 1. HEALTH CHECK & GEOCODING / UPLOAD (F1)
@@ -157,7 +163,7 @@ v1Router.post("/geo/validate-point", async (req, res) => {
 
 v1Router.post("/uploads/cloudinary-sign", (req, res, next) => {
   if (req.body?.registerPhoto && ["AFTER", "BEFORE"].includes(req.body.kind)) {
-    requireRoles("ADMIN", "SUPER_ADMIN", "PETUGAS_INSTANSI")(req, res, () => requireTrustedOrigin(req, res, next));
+    requireRoles(...AGENCY_PORTAL_ROLES)(req, res, () => requireTrustedOrigin(req, res, next));
   } else next();
 }, async (req, res) => {
   try {
@@ -358,7 +364,7 @@ v1Router.get("/public/reports", async (req, res) => {
       district,
       category,
     });
-    res.json({ success: true, data: rows });
+    res.json({ success: true, data: rows.map(toPublicReport) });
   } catch (err) {
     res.status(500).json({
       success: false,
@@ -392,7 +398,7 @@ v1Router.get("/public/reports/:id", async (req, res) => {
       });
       return;
     }
-    res.json({ success: true, data: found });
+    res.json({ success: true, data: toPublicReport(found) });
   } catch (err) {
     res.status(500).json({
       success: false,
@@ -430,67 +436,15 @@ v1Router.post("/public/reports/:id/upvote", async (req, res) => {
   }
 });
 
-v1Router.post("/auth/otp/request", async (req, res) => {
-  const { email } = req.body as { email?: string };
-  if (!email || !email.includes("@")) {
-    res.status(400).json({
-      success: false,
-      error: {
-        title: "Email Tidak Valid",
-        status: 400,
-        code: "INVALID_EMAIL",
-        detail: "Masukkan alamat email yang valid.",
-      },
-    });
-    return;
-  }
-  const result = await requestEmailOtp(email);
-  res.json({
-    success: true,
-    data: {
-      ...result,
-    },
-  });
-});
-
-v1Router.post("/auth/otp/verify", (req, res) => {
-  const { email, code } = req.body as { email?: string; code?: string };
-  const result = verifyEmailOtp(email || "", code || "");
-  if (!result.valid) {
-    res.status(400).json({
-      success: false,
-      error: {
-        title: "Kode OTP Salah atau Kedaluwarsa",
-        status: 400,
-        code: "INVALID_OTP",
-        detail: "Kode OTP yang Anda masukkan tidak cocok.",
-      },
-    });
-    return;
-  }
-  res.json({
-    success: true,
-    data: {
-      ...result,
-      verified: result.valid,
-      otpToken: result.verifiedEmailHash,
-    },
-  });
-});
-
-v1Router.post("/public/reports/:id/tags", async (req, res) => {
+v1Router.post("/public/reports/:id/tags", authorizeCommunity(), async (req, res) => {
   try {
-    const { tagCode, verifiedEmailHash, otpToken } = req.body as {
-      tagCode: string;
-      verifiedEmailHash?: string;
-      otpToken?: string;
-    };
+    const { tagCode } = req.body as { tagCode: string };
     const deviceId = String(req.headers["x-device-id"] || req.ip || "anon-tagger");
     const result = await addReportConditionTag({
-      reportIdOrCode: req.params.id,
+      reportIdOrCode: String(req.params.id),
       tagCode,
       deviceId,
-      verifiedEmailHash: verifiedEmailHash || otpToken || "verified_otp_session",
+      verifiedEmailHash: req.communityIdentity!.emailHash,
     });
     res.json({ success: true, data: result });
   } catch (err) {
@@ -506,7 +460,7 @@ v1Router.post("/public/reports/:id/tags", async (req, res) => {
   }
 });
 
-v1Router.post("/public/reports/:id/signoff", async (req, res) => {
+v1Router.post("/public/reports/:id/signoff", authorizeCommunity(), async (req, res) => {
   try {
     const { rating, decision, comment, fingerprint } = req.body as {
       rating?: "MULUS" | "CEPAT_RUSAK";
@@ -519,10 +473,11 @@ v1Router.post("/public/reports/:id/signoff", async (req, res) => {
       req.headers["x-device-id"] || fingerprint || req.ip || "anon-signoff"
     );
     const result = await submitCommunitySignoff({
-      reportIdOrCode: req.params.id,
+      reportIdOrCode: String(req.params.id),
       rating: chosenRating,
       comment,
       deviceId,
+      verifiedEmailHash: req.communityIdentity!.emailHash,
       rawIp: req.ip,
     });
     res.json({
@@ -561,19 +516,9 @@ v1Router.get("/track/:ticketCodeOrToken", async (req, res) => {
       return;
     }
 
-    const auditLogs = await db
-      .select()
-      .from(reportAuditLogs)
-      .where(eq(reportAuditLogs.reportId, data.id))
-      .orderBy(desc(reportAuditLogs.occurredAt))
-      .limit(20);
-
     res.json({
       success: true,
-      data: {
-        ...data,
-        auditLogs,
-      },
+      data,
     });
   } catch (err) {
     res.status(500).json({
@@ -591,10 +536,17 @@ v1Router.get("/track/:ticketCodeOrToken", async (req, res) => {
 // ============================================================================
 // 4. MODERASI ADMIN, BLUR FOTO, ROUTING, & ESKALASI EMAIL RESEND (F5, F7)
 // ============================================================================
-v1Router.get("/admin/reports", async (_req, res) => {
+v1Router.get("/admin/reports/merge-candidates", async (_req, res) => {
+  try { res.json({ success: true, data: await listMergeCandidates() }); }
+  catch { res.status(500).json({ success: false, error: { code: "MERGE_CANDIDATES_FAILED", detail: "Daftar tiket induk belum dapat dimuat." } }); }
+});
+
+v1Router.get("/admin/reports", async (req, res) => {
+  const parsed = adminQueueQuery.safeParse(req.query);
+  if (!parsed.success) { res.status(400).json({ success: false, error: { code: "INVALID_QUEUE_FILTER", detail: "Halaman atau filter antrean tidak valid." } }); return; }
   try {
-    const rows = await listEnrichedReports({ publicOnly: false });
-    res.json({ success: true, data: rows });
+    const data = await listAdminQueue(parsed.data);
+    res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({
       success: false,
@@ -605,6 +557,15 @@ v1Router.get("/admin/reports", async (_req, res) => {
         detail: err instanceof Error ? err.message : "Error",
       },
     });
+  }
+});
+
+v1Router.put("/admin/reports/:id/public-response", async (req, res) => {
+  try {
+    const data = await savePublicAdminResponse(req.params.id, req.body?.publicAdminResponse, req.ip);
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: "PUBLIC_RESPONSE_FAILED", title: "Tanggapan belum tersimpan", detail: err instanceof Error ? err.message : "Coba lagi." } });
   }
 });
 
@@ -713,15 +674,33 @@ v1Router.post("/admin/reports/:id/blur-photo", async (req, res) => {
   }
 });
 
+v1Router.get("/admin/agencies", async (_req, res) => {
+  try { res.json({ success: true, data: await db.select({ code: agencies.code, name: agencies.name, officialEmails: agencies.officialEmails }).from(agencies).where(eq(agencies.isActive, true)) }); }
+  catch { res.status(500).json({ success: false, error: { code: "AGENCIES_UNAVAILABLE", detail: "Daftar instansi belum dapat dimuat." } }); }
+});
+
+v1Router.post("/admin/reports/:id/verify-and-forward", async (req, res) => {
+  const body = z.object({ agencyCode: z.string().min(1).max(32), adminNote: z.string().max(4000).optional() }).safeParse(req.body);
+  if (!body.success) { res.status(400).json({ success: false, error: { code: "INVALID_FORWARD_INPUT", detail: "Pilih instansi dan periksa catatan admin (maksimal 4.000 karakter)." } }); return; }
+  try { res.json({ success: true, data: await adminForwarding.verifyAndForward({ reportIdOrCode: String(req.params.id), agencyCode: body.data.agencyCode, adminNoteText: body.data.adminNote, rawIp: req.ip }) }); }
+  catch (err) { res.status(400).json({ success: false, error: { code: "VERIFY_FORWARD_FAILED", detail: err instanceof Error ? err.message : "Verifikasi belum berhasil." } }); }
+});
+
+v1Router.post("/admin/reports/:id/retry-escalation-email", async (req, res) => {
+  const body = z.object({ escalationId: z.string().uuid() }).safeParse(req.body);
+  if (!body.success) { res.status(400).json({ success: false, error: { code: "INVALID_ESCALATION", detail: "Pilih pengiriman email yang valid." } }); return; }
+  try { res.json({ success: true, data: await adminForwarding.retryEmail(String(req.params.id), body.data.escalationId, req.ip) }); }
+  catch (err) { res.status(400).json({ success: false, error: { code: "EMAIL_RETRY_FAILED", detail: err instanceof Error ? err.message : "Email belum dapat dikirim ulang." } }); }
+});
+
 v1Router.post("/admin/reports/:id/escalate", async (req, res) => {
+  const parsed = z.object({ agencyCode: z.string().min(1).max(32), adminNote: z.string().max(4000).optional() }).safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ success: false, error: { code: "INVALID_FORWARD_INPUT", detail: "Pilih instansi dan periksa catatan admin (maksimal 4.000 karakter)." } }); return; }
   try {
-    const { agencyCode, adminNote } = req.body as {
-      agencyCode: string;
-      adminNote?: string;
-    };
-    const result = await adminEscalateReportToAgency({
-      reportIdOrCode: req.params.id,
-      agencyCode: agencyCode || "PUPR_KOTA_BOGOR",
+    const { agencyCode, adminNote } = parsed.data;
+    const result = await adminForwarding.forward({
+      reportIdOrCode: String(req.params.id),
+      agencyCode,
       adminNoteText: adminNote,
       rawIp: req.ip,
     });
@@ -729,8 +708,8 @@ v1Router.post("/admin/reports/:id/escalate", async (req, res) => {
       success: true,
       data: {
         ...result,
-        sentViaResend: result.deliveryStatus === "SENT",
-        messageId: result.providerMessageId || "",
+        sentViaResend: result.sentViaResend,
+        messageId: result.messageId,
       },
     });
   } catch (err) {
@@ -785,6 +764,21 @@ v1Router.get("/audit/logs", async (_req, res) => {
   res.json({ success: true, data: logs });
 });
 
+v1Router.post("/audit/export", requireTrustedOrigin, async (req, res) => {
+  const parsed = z.object({ format: z.enum(["csv", "json"]), ids: z.array(z.number().int().positive().max(Number.MAX_SAFE_INTEGER)).min(1).max(50).refine(ids => new Set(ids).size === ids.length) }).safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: { title: "Ekspor tidak valid", code: "INVALID_AUDIT_EXPORT", detail: "Pilih CSV atau JSON dan 1–50 entri audit yang unik." } });
+    return;
+  }
+  try {
+    const data = await exportAuditLogs({ ...parsed.data, actorId: req.authUser!.id, rawIp: req.ip, userAgent: req.get("user-agent") });
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ success: true, data });
+  } catch {
+    res.status(500).json({ success: false, error: { title: "Ekspor gagal", code: "AUDIT_EXPORT_FAILED", detail: "Ekspor belum dapat disiapkan atau dicatat. Segarkan riwayat lalu coba lagi." } });
+  }
+});
+
 // ============================================================================
 // 5. PORTAL INSTANSI SIMULASI (F6)
 // ============================================================================
@@ -821,7 +815,7 @@ v1Router.post("/agency/reports/:id/status", async (req, res) => {
         afterPhotoUrl?: string;
       };
     const result = await agencyUpdateReportStatus({
-      reportIdOrCode: req.params.id,
+      reportIdOrCode: String(req.params.id),
       agencyCode: agencyCode || "PUPR_KOTA_BOGOR",
       newStatus,
       plannedDate,
@@ -851,7 +845,7 @@ v1Router.post("/agency/reports/:id/return", async (req, res) => {
       reason: string;
     };
     const result = await agencyReturnReportToAdmin({
-      reportIdOrCode: req.params.id,
+      reportIdOrCode: String(req.params.id),
       agencyCode: agencyCode || "PUPR_KOTA_BOGOR",
       reason: reason || "Ruas jalan bukan kewenangan instansi ini",
       rawIp: req.ip,

@@ -203,6 +203,7 @@ export const reports = pgTable(
     duplicateOfId: uuid("duplicate_of_id"),
     rejectionReason: varchar("rejection_reason", { length: 100 }),
     rejectionNote: text("rejection_note"),
+    publicAdminResponse: text("public_admin_response"),
     returnedByAgency: boolean("returned_by_agency").default(false).notNull(),
     returnReason: text("return_reason"),
 
@@ -521,3 +522,28 @@ export const systemConfig = pgTable("system_config", {
   updatedBy: uuid("updated_by").references(() => users.id),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
+
+export const communityOtpChallenges = pgTable("community_otp_challenges", {
+  id: uuid("id").primaryKey(),
+  emailHash: varchar("email_hash", { length: 64 }).notNull().unique(),
+  reportId: uuid("report_id").notNull().references(() => reports.id, { onDelete: "cascade" }),
+  deviceHash: varchar("device_hash", { length: 64 }).notNull(),
+  codeHash: varchar("code_hash", { length: 64 }).notNull(),
+  requestedAt: timestamp("requested_at", { withTimezone: true }).notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  windowStartedAt: timestamp("window_started_at", { withTimezone: true }).notNull(),
+  requestCount: integer("request_count").default(1).notNull(),
+  attempts: integer("attempts").default(0).notNull(),
+  deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+  consumedAt: timestamp("consumed_at", { withTimezone: true }),
+});
+export const communityVerificationTokens = pgTable("community_verification_tokens", {
+  tokenHash: varchar("token_hash", { length: 64 }).primaryKey(),
+  emailHash: varchar("email_hash", { length: 64 }).notNull(),
+  reportId: uuid("report_id").notNull().references(() => reports.id, { onDelete: "cascade" }),
+  deviceHash: varchar("device_hash", { length: 64 }).notNull(),
+  purpose: varchar("purpose", { length: 40 }).default("PUBLIC_COMMUNITY_ACTION").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+}, table => ({ expiryIdx: index("idx_community_tokens_expiry").on(table.expiresAt) }));

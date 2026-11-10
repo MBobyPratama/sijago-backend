@@ -1,6 +1,7 @@
 import { Resend } from "resend";
+import { createHash } from "node:crypto";
 import { env } from "../config/env.js";
-import { hashWithSalt } from "../utils/hash.js";
+import { descriptionToText, type ReportDescriptionData } from "../utils/reportDescription.js";
 
 const resendClient = env.RESEND_API_KEY ? new Resend(env.RESEND_API_KEY) : null;
 const escapeEmailHtml = (value: string) => value.replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[character]!));
@@ -45,78 +46,17 @@ export async function sendTicketReceiptEmail(input: { reportId: string; ticketCo
   finally { if (timeout) clearTimeout(timeout); }
 }
 
-// Penyimpanan OTP ringan di memori server untuk keperluan verifikasi Tag Kondisi & Sign-Off (OQ-08)
-const otpStore = new Map<string, { code: string; expiresAt: number; verified: boolean }>();
-
-export async function requestEmailOtp(email: string): Promise<{
-  email: string;
-  sentViaResend: boolean;
-}> {
-  if (!resendClient) throw new Error("Layanan email belum dikonfigurasi.");
-  const cleanEmail = email.trim().toLowerCase();
-  const code = String(Math.floor(100000 + Math.random() * 900000));
-  otpStore.set(cleanEmail, {
-    code,
-    expiresAt: Date.now() + 10 * 60 * 1000,
-    verified: false,
-  });
-
-  let sentViaResend = false;
-  if (resendClient) {
-    try {
-      const res = await resendClient.emails.send({
-        from: env.RESEND_FROM_EMAIL,
-        to: [cleanEmail],
-        subject: `[SIJAGO Kota Bogor] Kode OTP Verifikasi Komunitas: ${code}`,
-        html: `
-          <div style="font-family: sans-serif; max-width: 520px; color: #0f172a;">
-            <h2 style="color: #1e40af;">Verifikasi Partisipasi Komunitas SIJAGO</h2>
-            <p>Gunakan kode OTP 6 digit berikut untuk menambahkan Tag Kondisi atau memberikan penilaian Community Sign-Off:</p>
-            <div style="font-size: 28px; font-weight: 800; letter-spacing: 6px; padding: 12px 16px; background: #f1f5f9; border-radius: 8px; display: inline-block;">
-              ${code}
-            </div>
-            <p style="font-size: 12px; color: #64748b; margin-top: 16px;">
-              Kode berlaku selama 10 menit. Abaikan email ini jika Anda tidak meminta verifikasi di SIJAGO.
-            </p>
-          </div>
-        `,
-      });
-      if (!res.error) {
-        sentViaResend = true;
-      }
-    } catch {
-      sentViaResend = false;
-    }
-  }
-
-  if (!sentViaResend) { otpStore.delete(cleanEmail); throw new Error("Kode verifikasi belum berhasil dikirim."); }
-  return {
-    email: cleanEmail,
-    sentViaResend,
-  };
-}
-
-export function verifyEmailOtp(email: string, code: string): {
-  valid: boolean;
-  verifiedEmailHash: string;
-} {
-  const cleanEmail = email.trim().toLowerCase();
-  const record = otpStore.get(cleanEmail);
-
-  const isMatch = record && record.code === code.trim() && Date.now() < record.expiresAt;
-
-  if (!isMatch) {
-    return { valid: false, verifiedEmailHash: "" };
-  }
-
-  if (record) {
-    record.verified = true;
-  }
-
-  return {
-    valid: true,
-    verifiedEmailHash: hashWithSalt(cleanEmail),
-  };
+export async function sendCommunityOtpCode(email: string, code: string): Promise<boolean> {
+  if (!resendClient) return false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      resendClient.emails.send({ from: env.RESEND_FROM_EMAIL, to: [email], subject: "[SIJAGO] Kode verifikasi partisipasi warga", text: `Kode verifikasi SIJAGO Anda: ${code}. Berlaku 10 menit dan hanya dapat digunakan sekali. Jangan bagikan kode ini kepada siapa pun. Abaikan jika Anda tidak meminta kode.`, html: `<div style="font-family:Arial,sans-serif;max-width:520px;line-height:1.7;color:#172c43"><h2>Verifikasi email SIJAGO</h2><p>Gunakan kode berikut untuk menambahkan tag atau penilaian pada laporan yang Anda buka.</p><p style="font-size:28px;font-weight:bold;color:#1e40af">${code}</p><p>Kode berlaku 10 menit dan hanya dapat digunakan sekali. Jangan bagikan kode ini. Abaikan email ini jika Anda tidak meminta kode.</p></div>` }),
+      new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("OTP_SEND_TIMEOUT")), 8000); }),
+    ]);
+    return !result.error && Boolean(result.data?.id);
+  } catch { return false; }
+  finally { if (timer) clearTimeout(timer); }
 }
 
 export interface SendEscalationEmailInput {
@@ -126,6 +66,7 @@ export interface SendEscalationEmailInput {
   permanentLabel: string;
   title: string;
   body: string;
+  description?: ReportDescriptionData;
   districtName: string;
   landmark: string;
   lat: string | number;
@@ -137,15 +78,7 @@ export interface SendEscalationEmailInput {
  * Mengirim email eskalasi resmi ke instansi melalui Resend (FR-5.6, FR-5.7, FR-5.8).
  * Hanya boleh dipanggil dari aksi eksplisit Admin (BRL-06).
  */
-export async function sendOfficialEscalationEmail(input: SendEscalationEmailInput): Promise<{
-  success: boolean;
-  providerMessageId: string | null;
-  deliveryStatus: "SENT" | "FAILED";
-  failureReason: string | null;
-  subject: string;
-  bodySnapshot: string;
-  sentTo: string[];
-}> {
+export function buildOfficialEscalationMessage(input: SendEscalationEmailInput) {
   const targetEmails = input.recipientEmails;
 
   const subject = `[ESKALASI RESMI SIJAGO ${input.ticketCode}] ${input.title}`;
@@ -158,7 +91,7 @@ export async function sendOfficialEscalationEmail(input: SendEscalationEmailInpu
     `Bersama email ini, Admin Moderator SIJAGO (Sistem Jalan Bogor) meneruskan laporan kerusakan jalan yang telah diverifikasi:`,
     `- Kode Tiket: ${input.ticketCode}`,
     `- Judul: ${input.title}`,
-    `- Deskripsi: ${input.body}`,
+    input.description ? `Deskripsi laporan:\n${descriptionToText(input.description)}` : `- Deskripsi: ${input.body}`,
     `- Lokasi: ${input.districtName} (${input.landmark})`,
     `- Koordinat GPS: ${input.lat}, ${input.lng} (${mapsUrl})`,
     input.adminNote ? `- Catatan Verifikasi Admin: ${input.adminNote}` : ``,
@@ -169,85 +102,20 @@ export async function sendOfficialEscalationEmail(input: SendEscalationEmailInpu
     .filter(Boolean)
     .join("\n");
 
-  if (!resendClient || targetEmails.length === 0) {
-    return {
-      success: false,
-      providerMessageId: null,
-      deliveryStatus: "FAILED",
-      failureReason: "Layanan email atau alamat instansi belum dikonfigurasi.",
-      subject,
-      bodySnapshot,
-      sentTo: targetEmails,
-    };
-  }
+  return { subject, bodySnapshot, sentTo: targetEmails };
+}
 
+export async function sendStoredEscalationEmail(input: { subject: string; bodySnapshot: string; sentTo: string[]; escalationId: string }) {
+  if (!resendClient || input.sentTo.length === 0) return { success: false, providerMessageId: null, failureReason: "Layanan email atau alamat instansi belum dikonfigurasi." };
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const result = await resendClient.emails.send({
-      from: env.RESEND_FROM_EMAIL,
-      to: targetEmails,
-      subject,
-      html: `
-        <div style="font-family: sans-serif; max-width: 620px; color: #0f172a; line-height: 1.6;">
-          <div style="background: #1e40af; color: #ffffff; padding: 14px 20px; border-radius: 10px 10px 0 0;">
-            <strong>SIJAGO (Sistem Jalan Bogor) — Eskalasi Resmi Laporan Terverifikasi</strong>
-          </div>
-          <div style="border: 1px solid #cbd5e1; border-top: none; padding: 20px; border-radius: 0 0 10px 10px;">
-            <p>Yth. <strong>${input.agencyName}</strong>,</p>
-            <p>Laporan kerusakan jalan berikut telah diverifikasi oleh Admin SIJAGO dan diteruskan sesuai kewenangan ruas jalan:</p>
-            <div style="background: #f8fafc; border: 1px solid #e2e8f0; padding: 14px; border-radius: 8px; margin: 12px 0;">
-              <div><strong>Kode Tiket:</strong> ${input.ticketCode}</div>
-
-              <div style="margin-top: 8px; font-weight: 700; font-size: 15px;">${input.title}</div>
-              <p style="margin: 6px 0;">${input.body}</p>
-              <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 10px 0;" />
-              <div style="font-size: 13px;">
-                <strong>Kecamatan / Patokan:</strong> ${input.districtName} — ${input.landmark}<br/>
-                <strong>Koordinat GPS:</strong> ${input.lat}, ${input.lng} (<a href="${mapsUrl}">Buka di OpenStreetMap</a>)<br/>
-                ${input.adminNote ? `<strong>Catatan Admin:</strong> ${input.adminNote}<br/>` : ""}
-                <strong>Privasi Pelapor:</strong> Disembunyikan sesuai aturan BRL-14.
-              </div>
-            </div>
-            <p>
-              <a href="${portalUrl}" style="display: inline-block; background: #059669; color: #ffffff; text-decoration: none; font-weight: 700; padding: 10px 16px; border-radius: 8px;">
-                Buka Portal Instansi &amp; Perbarui Status Perbaikan →
-              </a>
-            </p>
-          </div>
-        </div>
-      `,
-    });
-
-    if (result.error) {
-      // Jika sandbox Resend menolak alamat yang belum diverifikasi, tetap kembalikan informasi rõ
-      return {
-        success: false,
-        providerMessageId: null,
-        deliveryStatus: "FAILED",
-        failureReason: result.error.message,
-        subject,
-        bodySnapshot,
-        sentTo: targetEmails,
-      };
-    }
-
-    return {
-      success: true,
-      providerMessageId: result.data?.id ?? `re_${Date.now()}`,
-      deliveryStatus: "SENT",
-      failureReason: null,
-      subject,
-      bodySnapshot,
-      sentTo: targetEmails,
-    };
-  } catch (err) {
-    return {
-      success: false,
-      providerMessageId: null,
-      deliveryStatus: "FAILED",
-      failureReason: err instanceof Error ? err.message : "Resend error",
-      subject,
-      bodySnapshot,
-      sentTo: targetEmails,
-    };
-  }
+    const result = await Promise.race([
+      resendClient.emails.send({ from: env.RESEND_FROM_EMAIL, to: input.sentTo, subject: input.subject, text: input.bodySnapshot,
+        html: '<div style="font-family:sans-serif;max-width:620px;color:#172c43;line-height:1.7"><h2 style="color:#1e40af">Eskalasi resmi SIJAGO</h2><div style="white-space:pre-wrap;overflow-wrap:anywhere">' + escapeEmailHtml(input.bodySnapshot) + '</div></div>' }, { idempotencyKey: 'escalation/' + input.escalationId + '/' + createHash("sha256").update(JSON.stringify([input.subject, input.bodySnapshot, input.sentTo])).digest("hex").slice(0, 24) }),
+      new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Pengiriman email melewati batas waktu.")), 8000); }),
+    ]);
+    if (result.error || !result.data?.id) return { success: false, providerMessageId: null, failureReason: result.error?.message || "Penyedia email belum mengonfirmasi pengiriman." };
+    return { success: true, providerMessageId: result.data.id, failureReason: null };
+  } catch (err) { return { success: false, providerMessageId: null, failureReason: err instanceof Error ? err.message : "Email belum terkirim." }; }
+  finally { if (timer) clearTimeout(timer); }
 }

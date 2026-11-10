@@ -1,3 +1,4 @@
+import { buildReportDescription } from "../utils/reportDescription.js";
 import { eq, sql, desc, and, inArray, or, isNull } from "drizzle-orm";
 import crypto from "node:crypto";
 import { db } from "../db/index.js";
@@ -513,6 +514,7 @@ export async function generateAndSaveReportDraft(
     draftId: savedDraft.id,
     reportId: report.id,
     factsHash: savedDraft.factsHash,
+    description: buildReportDescription(factVersion),
     ...draftResult,
   };
 }
@@ -667,6 +669,7 @@ export async function getReportTrackingDetails(ticketCodeOrToken: string) {
     forwardedAt: report.forwardedAt,
     resolvedAt: report.resolvedAt,
     assignedAgencyName: agency?.name ?? null,
+    publicAdminResponse: report.publicAdminResponse,
     draft: draft
       ? {
           sourceType: draft.sourceType,

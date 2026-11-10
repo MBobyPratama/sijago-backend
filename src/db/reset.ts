@@ -4,6 +4,7 @@ import { env } from "../config/env.js";
 
 // Only this application's operational tables are reset. Master data and schema survive.
 const tables = [
+  "community_otp_challenges", "community_verification_tokens",
   "auth_sessions",
   "report_audit_logs", "agency_updates", "escalations", "admin_notes", "signoffs",
   "report_condition_tags", "report_upvotes", "report_approvals", "report_drafts",
