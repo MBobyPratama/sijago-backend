@@ -1,3 +1,8 @@
+import { summarizeReportForStaff } from "./services/reportSummary.service.js";
+import { suggestReportDuplicates } from "./services/duplicateSuggestions.service.js";
+import { photoAnalysisFailure } from "./services/photoAnalysis.service.js";
+import { PhotoSafetyError } from "./services/photoSafety.service.js";
+import { createPhotoAnalysisRouter } from "./photo-analysis.js";
 import { startReportMonitoring } from "./services/reportMonitoring.service.js";
 import { REPORT_DOCUMENT_CSP } from "./services/reportDocument.js";
 import { adminForwarding } from "./services/adminForwarding.service.js";
@@ -75,6 +80,7 @@ const apiLimiter = rateLimit({
 app.use(env.API_PREFIX, apiLimiter);
 
 const v1Router = express.Router();
+v1Router.use("/ai", createPhotoAnalysisRouter());
 v1Router.use("/auth", createAuthRouter());
 v1Router.use("/auth/otp", createCommunityOtpRouter());
 v1Router.use("/admin", requireRoles(...ADMIN_PORTAL_ROLES), requireTrustedOrigin);
@@ -162,6 +168,7 @@ v1Router.post("/geo/validate-point", async (req, res) => {
   });
 });
 
+v1Router.use("/uploads/cloudinary-sign", rateLimit({windowMs:60*1000,max:30,standardHeaders:true,legacyHeaders:false,message:{success:false,error:{code:"UPLOAD_RATE_LIMIT",detail:"Terlalu banyak percobaan unggah. Tunggu satu menit sebelum mencoba lagi."}}}));
 v1Router.post("/uploads/cloudinary-sign", (req, res, next) => {
   if (req.body?.registerPhoto && ["AFTER", "BEFORE"].includes(req.body.kind)) {
     requireRoles(...AGENCY_PORTAL_ROLES)(req, res, () => requireTrustedOrigin(req, res, next));
@@ -206,6 +213,7 @@ v1Router.post("/uploads/cloudinary-sign", (req, res, next) => {
     const sig = generateCloudinaryUploadSignature();
     res.json({ success: true, data: sig });
   } catch (err) {
+    if (err instanceof PhotoSafetyError) { res.status(err.status).json({success:false,error:{code:err.code,detail:err.message}}); return; }
     if (err instanceof AuthError) { authFailure(res, err); return; }
     res.status(500).json({
       success: false,
@@ -537,6 +545,16 @@ v1Router.get("/track/:ticketCodeOrToken", async (req, res) => {
 // ============================================================================
 // 4. MODERASI ADMIN, BLUR FOTO, ROUTING, & ESKALASI EMAIL RESEND (F5, F7)
 // ============================================================================
+v1Router.post(["/admin/reports/:id/summary","/agency/reports/:id/summary"],rateLimit({windowMs:60*1000,max:30,keyGenerator:req=>req.authUser!.id,standardHeaders:true,legacyHeaders:false,message:{success:false,error:{code:"SUMMARY_BURST_LIMIT",detail:"Terlalu banyak permintaan ringkasan. Tunggu satu menit."}}}),rateLimit({windowMs:15*60*1000,max:10,skipFailedRequests:true,keyGenerator:req=>req.authUser!.id,standardHeaders:true,legacyHeaders:false,message:{success:false,error:{code:"SUMMARY_RATE_LIMIT",detail:"Batas 10 ringkasan per 15 menit tercapai. Fakta Asal tetap dapat dibaca."}}}),async(req,res)=>{
+ try{const data=await summarizeReportForStaff(String(req.params.id));res.setHeader("Cache-Control","no-store");res.json({success:true,data});}
+ catch(error){if(error instanceof AuthError){authFailure(res,error);return;}res.status(503).json({success:false,error:{code:"SUMMARY_UNAVAILABLE",detail:"Ringkasan belum dapat dimuat. Baca Deskripsi dan Fakta Asal untuk melanjutkan penanganan."}});}
+});
+
+v1Router.post("/admin/reports/:id/duplicate-suggestions", rateLimit({windowMs:60*1000,max:20,keyGenerator:req=>req.authUser!.id,standardHeaders:true,legacyHeaders:false,message:{success:false,error:{code:"AI_DUPLICATE_BURST_LIMIT",detail:"Terlalu banyak percobaan pemeriksaan. Tunggu satu menit sebelum mencoba lagi."}}}), rateLimit({windowMs:15*60*1000,max:10,skipFailedRequests:true,keyGenerator:req=>req.authUser!.id,standardHeaders:true,legacyHeaders:false,message:{success:false,error:{code:"AI_DUPLICATE_RATE_LIMIT",detail:"Batas 10 pemeriksaan duplikat per 15 menit tercapai. Pemilihan tiket manual tetap tersedia."}}}),async(req,res)=>{
+ try{const data=await suggestReportDuplicates(String(req.params.id));res.setHeader("Cache-Control","no-store");res.json({success:true,data});}
+ catch(error){const failure=photoAnalysisFailure(error);res.status(503).json({success:false,error:{code:failure.code,detail:failure.code==="AI_PHOTO_UNAVAILABLE"?"Pemeriksaan duplikat belum berhasil. Pastikan laporan aktif memiliki foto; pemilihan tiket manual tetap tersedia.":failure.detail}});}
+});
+
 v1Router.get("/admin/reports/merge-candidates", async (_req, res) => {
   try { res.json({ success: true, data: await listMergeCandidates() }); }
   catch { res.status(500).json({ success: false, error: { code: "MERGE_CANDIDATES_FAILED", detail: "Daftar tiket induk belum dapat dimuat." } }); }
