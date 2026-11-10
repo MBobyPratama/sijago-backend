@@ -44,19 +44,25 @@ export async function listEnrichedReports(options?: {
   category?: string;
   agencyCode?: string;
   reportIds?: string[];
-}) {
+}, database: Pick<typeof db, "select"> = db) {
   if (options?.reportIds?.length === 0) return [];
-  const allReports = await db
+  const allReports = await database
     .select()
     .from(reports)
-    .where(and(ne(reports.status, "DRAFT"), options?.reportIds ? inArray(reports.id, options.reportIds) : undefined))
+    .where(and(
+      ne(reports.status, "DRAFT"),
+      options?.reportIds ? inArray(reports.id, options.reportIds) : undefined,
+      options?.agencyCode && options.agencyCode !== "ALL"
+        ? and(eq(reports.returnedByAgency, false), sql`${reports.assignedAgencyId} IN (SELECT ${agencies.id} FROM ${agencies} WHERE ${agencies.code} = ${options.agencyCode})`)
+        : undefined,
+    ))
     .orderBy(desc(reports.priorityScore), desc(reports.createdAt))
     .limit(options?.reportIds ? options.reportIds.length : 50);
 
-  const allAgencies = await db.select().from(agencies);
+  const allAgencies = await database.select().from(agencies);
   const agencyMap = new Map(allAgencies.map((a) => [a.id, a]));
 
-  const escalationRows = await db.select({ id: escalations.id, reportId: escalations.reportId, agencyId: escalations.agencyId, deliveryStatus: escalations.deliveryStatus, failureReason: escalations.failureReason, updatedAt: escalations.updatedAt }).from(escalations).where(inArray(escalations.reportId, allReports.map(report => report.id))).orderBy(desc(escalations.sentAt));
+  const escalationRows = await database.select({ id: escalations.id, reportId: escalations.reportId, agencyId: escalations.agencyId, deliveryStatus: escalations.deliveryStatus, failureReason: escalations.failureReason, updatedAt: escalations.updatedAt }).from(escalations).where(inArray(escalations.reportId, allReports.map(report => report.id))).orderBy(desc(escalations.sentAt));
   const forwardedReports = new Set(escalationRows.map(item => item.reportId));
   const results = [];
 
@@ -69,7 +75,7 @@ export async function listEnrichedReports(options?: {
     }
 
     const [fact] = rep.currentFactsVersionId
-      ? await db
+      ? await database
           .select()
           .from(reportFactVersions)
           .where(eq(reportFactVersions.id, rep.currentFactsVersionId))
@@ -86,19 +92,19 @@ export async function listEnrichedReports(options?: {
     }
 
     const [draft] = rep.approvedDraftId
-      ? await db
+      ? await database
           .select()
           .from(reportDrafts)
           .where(eq(reportDrafts.id, rep.approvedDraftId))
           .limit(1)
-      : await db
+      : await database
           .select()
           .from(reportDrafts)
           .where(eq(reportDrafts.reportId, rep.id))
           .orderBy(desc(reportDrafts.createdAt))
           .limit(1);
 
-    const tagsRows = await db
+    const tagsRows = await database
       .select({
         tagCode: reportConditionTags.tagCode,
         count: sql<number>`COUNT(*)::int`,
@@ -107,17 +113,17 @@ export async function listEnrichedReports(options?: {
       .where(eq(reportConditionTags.reportId, rep.id))
       .groupBy(reportConditionTags.tagCode);
 
-    const signoffRows = await db
+    const signoffRows = await database
       .select()
       .from(signoffs)
       .where(eq(signoffs.reportId, rep.id));
 
-    const photos = await db
+    const photos = await database
       .select()
       .from(reportPhotos)
       .where(eq(reportPhotos.reportId, rep.id));
 
-    const notes = await db
+    const notes = await database
       .select()
       .from(adminNotes)
       .where(eq(adminNotes.reportId, rep.id))
@@ -501,51 +507,38 @@ export async function adminRejectReport(
 export async function adminMergeDuplicateReport(
   duplicateIdOrCode: string,
   parentIdOrCode: string,
-  rawIp?: string
+  rawIp?: string,
+  database: Pick<typeof db, "select" | "transaction"> = db,
 ) {
-  const dup = await findReportByIdOrCode(duplicateIdOrCode);
-  const parent = await findReportByIdOrCode(parentIdOrCode);
-  if (!dup || !parent) throw new Error("REPORT_NOT_FOUND");
   const adminUser = await getAuthenticatedAdminUser();
+  const duplicate = await findReportByIdOrCode(duplicateIdOrCode, database);
+  const master = await findReportByIdOrCode(parentIdOrCode, database);
+  if (!duplicate || !master) throw new Error("REPORT_NOT_FOUND");
+  if (duplicate.id === master.id) throw new Error("Laporan induk harus berbeda dari laporan yang digabung.");
 
-  const mergedUpvotes = parent.upvoteCount + dup.upvoteCount;
+  return database.transaction(async tx => {
+    // Consistent lock order prevents two opposing merges from creating a cycle.
+    const locked = await tx.select().from(reports).where(inArray(reports.id, [duplicate.id, master.id])).orderBy(reports.id).for("update");
+    const dup = locked.find(item => item.id === duplicate.id)!;
+    const parent = locked.find(item => item.id === master.id)!;
+    if (["DRAFT", "DUPLIKAT", "DITOLAK"].includes(parent.status) || parent.duplicateOfId) throw new Error("Laporan induk tidak lagi tersedia untuk penggabungan.");
+    if (dup.status === "DUPLIKAT" && dup.duplicateOfId === parent.id) return { duplicateTicket: dup.ticketCode, parentTicket: parent.ticketCode, newParentUpvotes: parent.upvoteCount };
+    if (dup.duplicateOfId || ["DRAFT", "DUPLIKAT", "DITOLAK"].includes(dup.status)) throw new Error("Laporan ini tidak dapat digabungkan.");
+    // Do not create a chain that leaves existing duplicates pointing at an inactive parent.
+    const children = await tx.select({id:reports.id}).from(reports).where(eq(reports.duplicateOfId, dup.id)).limit(1);
+    if (children.length) throw new Error("Laporan ini sudah menjadi induk. Pilih laporan ini sebagai induk penggabungan.");
 
-  await db
-    .update(reports)
-    .set({
-      status: "DUPLIKAT",
-      duplicateOfId: parent.id,
-      updatedAt: new Date(),
-    })
-    .where(eq(reports.id, dup.id));
-
-  await db
-    .update(reports)
-    .set({
-      upvoteCount: mergedUpvotes,
-      updatedAt: new Date(),
-    })
-    .where(eq(reports.id, parent.id));
-
-  await appendAuditLog({
-    reportId: dup.id,
-    actorId: adminUser.email,
-    actorType: "ADMIN",
-    actionType: "DUPLICATE_MERGED",
-    snapshotBefore: { status: dup.status, parentUpvotes: parent.upvoteCount },
-    snapshotAfter: {
-      status: "DUPLIKAT",
-      mergedIntoTicket: parent.ticketCode,
-      newParentUpvotes: mergedUpvotes,
-    },
-    rawIp,
+    const votes = await tx.select().from(reportUpvotes).where(eq(reportUpvotes.reportId, dup.id));
+    if (votes.length) await tx.insert(reportUpvotes).values(votes.map(vote => ({reportId:parent.id, voterKey:vote.voterKey, createdAt:vote.createdAt}))).onConflictDoNothing();
+    const tags = await tx.select().from(reportConditionTags).where(eq(reportConditionTags.reportId, dup.id));
+    if (tags.length) await tx.insert(reportConditionTags).values(tags.map(tag => ({reportId:parent.id, tagCode:tag.tagCode, voterKey:tag.voterKey, verifiedEmailHash:tag.verifiedEmailHash, createdAt:tag.createdAt}))).onConflictDoNothing();
+    const [count] = await tx.select({total:sql<number>`count(*)::int`}).from(reportUpvotes).where(eq(reportUpvotes.reportId, parent.id));
+    const mergedUpvotes = count.total;
+    await tx.update(reports).set({status:"DUPLIKAT", duplicateOfId:parent.id, updatedAt:new Date()}).where(eq(reports.id,dup.id));
+    await tx.update(reports).set({upvoteCount:mergedUpvotes, updatedAt:new Date()}).where(eq(reports.id,parent.id));
+    await appendAuditLog({reportId:dup.id,actorId:adminUser.email,actorType:"ADMIN",actionType:"DUPLICATE_MERGED",snapshotBefore:{status:dup.status,parentUpvotes:parent.upvoteCount},snapshotAfter:{status:"DUPLIKAT",mergedIntoTicket:parent.ticketCode,newParentUpvotes:mergedUpvotes,sourceVoteRecords:votes.length,sourceTagRecords:tags.length},rawIp},tx);
+    return {duplicateTicket:dup.ticketCode,parentTicket:parent.ticketCode,newParentUpvotes:mergedUpvotes};
   });
-
-  return {
-    duplicateTicket: dup.ticketCode,
-    parentTicket: parent.ticketCode,
-    newParentUpvotes: mergedUpvotes,
-  };
 }
 
 /**
@@ -620,7 +613,10 @@ export async function agencyUpdateReportStatus(params: {
   });
 
   const now = new Date();
-  const monitoringEnds = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+  const [monitoringConfig] = await db.select().from(systemConfig).where(eq(systemConfig.key, "signoff_monitoring_days")).limit(1);
+  const configuredDays = Number(monitoringConfig?.value ?? 30);
+  const monitoringDays = Number.isInteger(configuredDays) && configuredDays > 0 ? configuredDays : 30;
+  const monitoringEnds = new Date(now.getTime() + monitoringDays * 24 * 60 * 60 * 1000);
 
   await db
     .update(reports)
@@ -663,14 +659,16 @@ export async function agencyReturnReportToAdmin(params: {
   agencyCode: string;
   reason: string;
   rawIp?: string;
-}) {
-  const rep = await findReportByIdOrCode(params.reportIdOrCode);
+}, database: Pick<typeof db, "select" | "update" | "insert"> = db) {
+  const rep = await findReportByIdOrCode(params.reportIdOrCode, database);
   if (!rep) throw new Error("REPORT_NOT_FOUND");
 
-  await db
+  await database
     .update(reports)
     .set({
       status: "TERVERIFIKASI",
+      assignedAgencyId: null,
+      forwardedAt: null,
       returnedByAgency: true,
       returnReason: params.reason,
       updatedAt: new Date(),
@@ -682,14 +680,15 @@ export async function agencyReturnReportToAdmin(params: {
     actorId: authContext.getStore()?.id || `petugas:${params.agencyCode}`,
     actorType: "INSTANSI",
     actionType: "STATUS_CHANGED",
-    snapshotBefore: { status: rep.status },
+    snapshotBefore: { status: rep.status, assignedAgencyId: rep.assignedAgencyId },
     snapshotAfter: {
       status: "TERVERIFIKASI",
+      assignedAgencyId: null,
       returnedByAgency: true,
       returnReason: params.reason,
     },
     rawIp: params.rawIp,
-  });
+  }, database);
 
   return {
     reportId: rep.id,

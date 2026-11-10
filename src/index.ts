@@ -1,3 +1,4 @@
+import { startReportMonitoring } from "./services/reportMonitoring.service.js";
 import { REPORT_DOCUMENT_CSP } from "./services/reportDocument.js";
 import { adminForwarding } from "./services/adminForwarding.service.js";
 import { toPublicReport } from "./utils/publicReport.js";
@@ -974,6 +975,7 @@ v1Router.post("/drafts/preview", async (req, res) => {
 app.use(env.API_PREFIX, v1Router);
 
 app.listen(env.PORT, () => {
+  startReportMonitoring();
   console.log(
     `🚀 [SIJAGO BACKEND] Berjalan di http://localhost:${env.PORT}${env.API_PREFIX}/health`
   );
