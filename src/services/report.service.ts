@@ -1,3 +1,4 @@
+import { checkEvidencePhoto } from "./photoSafety.service.js";
 import { buildReportDescription } from "../utils/reportDescription.js";
 import { eq, sql, desc, and, inArray, or, isNull } from "drizzle-orm";
 import crypto from "node:crypto";
@@ -158,11 +159,14 @@ function validateReportFacts(payload: SaveReportFactsPayload) {
 type PhotoTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
 /** Claim uploaded evidence atomically; never move evidence belonging to another report. */
-export async function linkReportPhotos(tx: PhotoTransaction, reportId: string, photoIds: string[]) {
+export async function linkReportPhotos(tx: PhotoTransaction, reportId: string, photoIds: string[], checkPhoto = checkEvidencePhoto) {
   const ids = [...new Set(photoIds)];
   if (ids.length === 0 || ids.some(id => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))) {
     throw new Error("Foto tidak valid. Unggah kembali foto kerusakan.");
   }
+  const evidence = await tx.select().from(reportPhotos).where(and(inArray(reportPhotos.id, ids),inArray(reportPhotos.kind,["REPORT","BEFORE"]),or(isNull(reportPhotos.reportId),eq(reportPhotos.reportId,reportId))));
+  if (evidence.length !== ids.length) throw new Error("Foto laporan tidak ditemukan.");
+  for (const photo of evidence) await checkPhoto(photo.cloudinaryPublicId, true);
   const linked = await tx.update(reportPhotos).set({ reportId }).where(and(
     inArray(reportPhotos.id, ids),
     inArray(reportPhotos.kind, ["REPORT", "BEFORE"]),
@@ -592,6 +596,9 @@ export async function submitReportFinal(params: {
     const [approval] = await tx.select().from(reportApprovals).where(and(eq(reportApprovals.reportId, report.id), eq(reportApprovals.draftId, params.draftId), eq(reportApprovals.approvedFactsHash, params.approvedFactsHash), eq(reportApprovals.isValid, true))).limit(1);
     const [draft] = await tx.select().from(reportDrafts).where(and(eq(reportDrafts.id, params.draftId), eq(reportDrafts.reportId, report.id), eq(reportDrafts.factsHash, params.approvedFactsHash), eq(reportDrafts.isStale, false))).limit(1);
     if (!approval || !draft) throw Object.assign(new Error("APPROVAL_HASH_MISMATCH"), { status: 409 });
+    const [facts] = await tx.select().from(reportFactVersions).where(eq(reportFactVersions.id, report.currentFactsVersionId!)).limit(1);
+    if (!facts?.photoIds?.length) throw new Error("Tambahkan foto kerusakan terlebih dahulu.");
+    await linkReportPhotos(tx, report.id, facts.photoIds);
     const submittedAt = new Date();
     const [saved] = await tx.update(reports).set({ status: "MENUNGGU_VERIFIKASI", approvedDraftId: params.draftId, submittedAt, idempotencyKey: key, updatedAt: submittedAt, receiptEmailStatus: report.receiptEmailTo ? "PENDING" : "NOT_REQUESTED" }).where(eq(reports.id, report.id)).returning();
     await appendAuditLog({ reportId: report.id, actorId: "warga_pelapor", actorType: "WARGA_PSEUDONIM", actionType: "REPORT_SUBMITTED", snapshotBefore: { status: "DRAFT" }, snapshotAfter: { status: saved.status, ticketCode: report.ticketCode, approvedFactsHash: params.approvedFactsHash, draftId: params.draftId }, rawIp: params.rawIp }, tx);

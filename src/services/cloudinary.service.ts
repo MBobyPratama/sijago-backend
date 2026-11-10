@@ -1,3 +1,4 @@
+import { checkEvidencePhoto } from "./photoSafety.service.js";
 import { v2 as cloudinary } from "cloudinary";
 import crypto from "node:crypto";
 import { env } from "../config/env.js";
@@ -143,7 +144,7 @@ export async function registerUploadedPhoto(params: {
       kind: params.kind ?? "REPORT",
       cloudinaryPublicId: params.cloudinaryPublicId,
       publicUrl,
-      originalSecureUrl: params.originalSecureUrl,
+      originalSecureUrl: publicUrl,
       sha256,
       exifTakenAt: params.exifTakenAt ? new Date(params.exifTakenAt) : null,
       exifLat: params.exifLat != null ? String(params.exifLat) : null,

@@ -28,6 +28,13 @@ const envSchema = z.object({
     .default("true")
     .transform((v) => v === "true"),
 
+  AI_SUMMARY_ENABLED: z.string().default("true").transform(v => v === "true"),
+  OPENAI_SUMMARY_MODEL: z.string().optional(),
+  AI_DUPLICATE_ENABLED: z.string().default("true").transform(v => v === "true"),
+  AI_PHOTO_ENABLED: z.string().default("true").transform(v => v === "true"),
+  OPENAI_VISION_MODEL: z.string().optional(),
+  AI_PHOTO_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60000).default(20000),
+
   // Cloudinary
   CLOUDINARY_CLOUD_NAME: z.string().optional(),
   CLOUDINARY_API_KEY: z.string().optional(),
