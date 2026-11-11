@@ -1,4 +1,4 @@
-import { summarizeReportForStaff } from "./services/reportSummary.service.js";
+import { summarizeAgencyQueue } from "./services/reportSummary.service.js";
 import { suggestReportDuplicates } from "./services/duplicateSuggestions.service.js";
 import { photoAnalysisFailure } from "./services/photoAnalysis.service.js";
 import { PhotoSafetyError } from "./services/photoSafety.service.js";
@@ -545,9 +545,9 @@ v1Router.get("/track/:ticketCodeOrToken", async (req, res) => {
 // ============================================================================
 // 4. MODERASI ADMIN, BLUR FOTO, ROUTING, & ESKALASI EMAIL RESEND (F5, F7)
 // ============================================================================
-v1Router.post(["/admin/reports/:id/summary","/agency/reports/:id/summary"],rateLimit({windowMs:60*1000,max:30,keyGenerator:req=>req.authUser!.id,standardHeaders:true,legacyHeaders:false,message:{success:false,error:{code:"SUMMARY_BURST_LIMIT",detail:"Terlalu banyak permintaan ringkasan. Tunggu satu menit."}}}),rateLimit({windowMs:15*60*1000,max:10,skipFailedRequests:true,keyGenerator:req=>req.authUser!.id,standardHeaders:true,legacyHeaders:false,message:{success:false,error:{code:"SUMMARY_RATE_LIMIT",detail:"Batas 10 ringkasan per 15 menit tercapai. Fakta Asal tetap dapat dibaca."}}}),async(req,res)=>{
- try{const data=await summarizeReportForStaff(String(req.params.id));res.setHeader("Cache-Control","no-store");res.json({success:true,data});}
- catch(error){if(error instanceof AuthError){authFailure(res,error);return;}res.status(503).json({success:false,error:{code:"SUMMARY_UNAVAILABLE",detail:"Ringkasan belum dapat dimuat. Baca Deskripsi dan Fakta Asal untuk melanjutkan penanganan."}});}
+v1Router.post("/agency/queue-summary",rateLimit({windowMs:60*1000,max:30,keyGenerator:req=>req.authUser!.id,standardHeaders:true,legacyHeaders:false,message:{success:false,error:{code:"SUMMARY_BURST_LIMIT",detail:"Terlalu banyak permintaan ringkasan. Tunggu satu menit."}}}),rateLimit({windowMs:15*60*1000,max:10,skipFailedRequests:true,keyGenerator:req=>req.authUser!.id,standardHeaders:true,legacyHeaders:false,message:{success:false,error:{code:"SUMMARY_RATE_LIMIT",detail:"Batas 10 ringkasan per 15 menit tercapai. Fakta Asal tetap dapat dibaca."}}}),async(req,res)=>{
+ try{const data=await summarizeAgencyQueue(req.body);res.setHeader("Cache-Control","no-store");res.json({success:true,data});}
+ catch(error){if(error instanceof z.ZodError){res.status(400).json({success:false,error:{code:"INVALID_SUMMARY_SCOPE",detail:"Pilih cakupan yang valid, maksimal 25 laporan."}});return;}if(error instanceof AuthError){authFailure(res,error);return;}res.status(503).json({success:false,error:{code:"SUMMARY_UNAVAILABLE",detail:"Ringkasan belum dapat dimuat. Baca Deskripsi dan Fakta Asal untuk melanjutkan penanganan."}});}
 });
 
 v1Router.post("/admin/reports/:id/duplicate-suggestions", rateLimit({windowMs:60*1000,max:20,keyGenerator:req=>req.authUser!.id,standardHeaders:true,legacyHeaders:false,message:{success:false,error:{code:"AI_DUPLICATE_BURST_LIMIT",detail:"Terlalu banyak percobaan pemeriksaan. Tunggu satu menit sebelum mencoba lagi."}}}), rateLimit({windowMs:15*60*1000,max:10,skipFailedRequests:true,keyGenerator:req=>req.authUser!.id,standardHeaders:true,legacyHeaders:false,message:{success:false,error:{code:"AI_DUPLICATE_RATE_LIMIT",detail:"Batas 10 pemeriksaan duplikat per 15 menit tercapai. Pemilihan tiket manual tetap tersedia."}}}),async(req,res)=>{
@@ -786,7 +786,7 @@ v1Router.get("/audit/logs", async (_req, res) => {
 v1Router.post("/audit/export", requireTrustedOrigin, async (req, res) => {
   const parsed = z.object({ format: z.enum(["csv", "json"]), ids: z.array(z.number().int().positive().max(Number.MAX_SAFE_INTEGER)).min(1).max(50).refine(ids => new Set(ids).size === ids.length) }).safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ success: false, error: { title: "Ekspor tidak valid", code: "INVALID_AUDIT_EXPORT", detail: "Pilih CSV atau JSON dan 1–50 entri audit yang unik." } });
+    res.status(400).json({ success: false, error: { title: "Ekspor tidak valid", code: "INVALID_AUDIT_EXPORT", detail: "Pilih CSV atau JSON dan 1â€“50 entri audit yang unik." } });
     return;
   }
   try {
@@ -995,6 +995,6 @@ app.use(env.API_PREFIX, v1Router);
 app.listen(env.PORT, () => {
   startReportMonitoring();
   console.log(
-    `🚀 [SIJAGO BACKEND] Berjalan di http://localhost:${env.PORT}${env.API_PREFIX}/health`
+    `ðŸš€ [SIJAGO BACKEND] Berjalan di http://localhost:${env.PORT}${env.API_PREFIX}/health`
   );
 });

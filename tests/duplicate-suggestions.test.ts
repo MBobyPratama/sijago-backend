@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import {env} from "../src/config/env.js";
 import {randomUUID} from "node:crypto";
 import {eq,inArray} from "drizzle-orm";
 import {db,pool} from "../src/db/index.js";
@@ -27,6 +28,8 @@ try{
   await authContext.run(actor,async()=>{
    const result=await service(source.id);assert.equal(result.candidatesFound,3);assert.equal(result.evaluated,2);assert.equal(result.skipped,1);assert.equal(result.suggestions.length,1);assert.equal(result.suggestions[0].id,a.id);assert(!('image' in result.suggestions[0]));assert.equal(result.cached,false);
    assert.equal((await service(source.id)).cached,true);assert.equal(comparisons,1);
+   const enabled=env.AI_DUPLICATE_ENABLED;env.AI_DUPLICATE_ENABLED=false;
+   try{await assert.rejects(service(source.id),/dinonaktifkan/);assert.equal(comparisons,1);}finally{env.AI_DUPLICATE_ENABLED=enabled;}
    await tx.update(reports).set({status:"DITUTUP"}).where(eq(reports.id,source.id));await assert.rejects(service(source.id));
    await tx.update(reports).set({status:"MENUNGGU_VERIFIKASI"}).where(eq(reports.id,source.id));
    const broken=createDuplicateSuggestionService(tx,load,check,async()=>[{id:randomUUID(),match:"LIKELY",reason:"Invented candidate"}]);await assert.rejects(broken(source.id));

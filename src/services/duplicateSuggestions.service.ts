@@ -36,6 +36,7 @@ export function createDuplicateSuggestionService(database:Pick<typeof db,"select
  const cache=new Map<string,{expires:number;result:Promise<DuplicateVerdict[]>}>();
  return async(id:string)=>{
   await getAuthenticatedAdminUser();
+  if(!env.AI_DUPLICATE_ENABLED)throw new Error("Saran AI dinonaktifkan. Pilih tiket induk secara manual.");
   const source=await findReportByIdOrCode(id,database);if(!source)throw new Error("Laporan tidak ditemukan.");
   if(!SOURCE_STATUSES.includes(source.status)||source.duplicateOfId)throw new Error("Saran duplikat hanya tersedia untuk laporan aktif yang belum digabung.");
   const point=`SRID=4326;POINT(${source.lng} ${source.lat})`;

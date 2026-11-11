@@ -106,12 +106,10 @@ export async function registerUploadedPhoto(params: {
   exifLng?: number | null;
   exifTakenAt?: string | null;
   uploadedByActor: string;
-}) {
-  const publicUrl = buildStrippedPublicImageUrl(
-    params.cloudinaryPublicId,
-    params.originalSecureUrl,
-    false
-  );
+}, dependencies: { database?: Pick<typeof db, "insert">; checkPhoto?: typeof checkEvidencePhoto } = {}) {
+  const database = dependencies.database ?? db;
+  const checkPhoto = dependencies.checkPhoto ?? checkEvidencePhoto;
+  const publicUrl = await checkPhoto(params.cloudinaryPublicId, ["REPORT", "BEFORE"].includes(params.kind ?? "REPORT"));
 
   let exifDistanceMeters: number | null = null;
   let exifMismatchFlag = false;
@@ -137,7 +135,7 @@ export async function registerUploadedPhoto(params: {
     .update(`${params.cloudinaryPublicId}:${params.originalSecureUrl}`)
     .digest("hex");
 
-  const [photo] = await db
+  const [photo] = await database
     .insert(reportPhotos)
     .values({
       reportId: params.reportId ?? null,
