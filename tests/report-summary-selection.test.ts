@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
-import OpenAI from "openai";
+import {randomUUID} from "node:crypto";
+import {queueSummaryInput,validateQueuePatterns,redactSummaryText,summarizePatterns} from "../src/services/reportSummary.service.js";
 import {env} from "../src/config/env.js";
-import {summarySegments,validateSummarySelection,selectSummaryHighlights} from "../src/services/reportSummary.service.js";
-const segments=summarySegments("Jalan berlubang sedalam 5 cm. Hubungi test@example.com atau +628123456789. Pengendara menghindari titik ini.");
-assert(!segments.join(' ').includes('test@example.com'));assert(!segments.join(' ').includes('628123456789'));
-assert(segments.some(text=>text.includes('5 cm')));
-assert.deepEqual(validateSummarySelection({indices:[2,0]},3),[0,2]);
-for(const invalid of[{indices:[9]},{indices:[0,0]},{indices:[]},{indices:[0,1,2,3]},{indices:["0"]},{indices:[0],summary:"Invented fact"}])assert.throws(()=>validateSummarySelection(invalid,3));
+const ids=[randomUUID(),randomUUID()];const sources=ids.map(id=>({id,condition:"Jalan tergenang."}));
+assert(queueSummaryInput.safeParse({mode:"FILTER"}).success);
+for(const raw of [{mode:"SELECTED"},{mode:"SELECTED",reportIds:[ids[0],ids[0]]},{mode:"SELECTED",reportIds:Array.from({length:26},randomUUID)},{mode:"FILTER",reportIds:ids}])assert(!queueSummaryInput.safeParse(raw).success);
+assert(!redactSummaryText('test@example.com https://example.com +6281234567890').includes('test@example'));
+assert.deepEqual(validateQueuePatterns({patterns:[]},sources),[]);
+for(const reportIds of [[ids[0]],[ids[0],ids[0]],[ids[0],randomUUID()]])assert.throws(()=>validateQueuePatterns({patterns:[{text:"Genangan",reportIds}]},sources));
+let payload:any;let finish="stop";const client:any={chat:{completions:{create:async(p:any)=>{payload=p;return {choices:[{finish_reason:finish,message:{content:JSON.stringify({patterns:[{text:"Dua laporan menyebut genangan.",reportIds:ids}]})}}]};}}}};
 const enabled=env.AI_SUMMARY_ENABLED;env.AI_SUMMARY_ENABLED=true;
-let payload:any,finish="stop",refusal:string|null=null;
-const client={chat:{completions:{create:async(input:unknown)=>{payload=input;return{choices:[{finish_reason:finish,message:{content:JSON.stringify({indices:[0,2]}),refusal}}]};}}}} as unknown as Pick<OpenAI,"chat">;
-try{assert.deepEqual(await selectSummaryHighlights(segments,client),[0,2]);assert.equal(payload.max_completion_tokens,256);assert.equal(payload.store,false);assert.equal(typeof payload.messages[1].content,'string');assert(!JSON.stringify(payload).includes('test@example.com'));finish='length';await assert.rejects(selectSummaryHighlights(segments,client));finish='stop';refusal='Refused';await assert.rejects(selectSummaryHighlights(segments,client));env.AI_SUMMARY_ENABLED=false;await assert.rejects(selectSummaryHighlights(segments,client));}finally{env.AI_SUMMARY_ENABLED=enabled;}
-console.log('PASS: redacted source segments, validated indices only, small text-only request, incomplete/refused/disabled outputs rejected. Mock OpenAI only.');
+try{assert.equal((await summarizePatterns(sources,client)).length,1);assert.equal(payload.store,false);assert.equal(payload.max_completion_tokens,1200);assert.equal(typeof payload.messages[1].content,'string');finish='length';await assert.rejects(summarizePatterns(sources,client));env.AI_SUMMARY_ENABLED=false;await assert.rejects(summarizePatterns(sources,client));}finally{env.AI_SUMMARY_ENABLED=enabled;}
+console.log('PASS queue scope limits, privacy redaction, source validation and mock-only structured AI.');

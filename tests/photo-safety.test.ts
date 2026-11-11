@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import OpenAI from "openai";
+import {env} from "../src/config/env.js";
 import {createPhotoSafety, PhotoSafetyError} from "../src/services/photoSafety.service.js";
 const image='data:image/png;base64,'+Buffer.from([137,80,78,71,13,10,26,10,0,0,0,0]).toString('base64');
 let moderation=0,classifications=0,analyses=0,flagged=false,relevant=true,fail=false;
@@ -14,3 +15,12 @@ fail=true;const retry=factory();await assert.rejects(retry.check(image));fail=fa
 const prior=classifications;await factory().check(image,false);assert.equal(classifications,prior); // repaired/signoff evidence still moderated, without a damage requirement
 await assert.rejects(service.check('https://untrusted.example/image.png'));
 console.log('PASS: unsafe and irrelevant photos blocked before suggestions; fail-closed provider errors; single-flight cache and changed-content recheck; repaired photos still moderated. No live AI or database writes.');
+
+const enabled=env.AI_PHOTO_ENABLED;env.AI_PHOTO_ENABLED=false;try{await assert.rejects(service.analyze(image));}finally{env.AI_PHOTO_ENABLED=enabled;}
+console.log('PASS disabling photo assistance also rejects previously cached suggestions.');
+
+for(const raw of [{relevant:true,unexpected:true},{relevant:"true"},{}]){
+ const malformed={moderations:client.moderations,chat:{completions:{create:async()=>({choices:[{finish_reason:'stop',message:{content:JSON.stringify(raw)}}]})}}} as unknown as Pick<OpenAI,'moderations'|'chat'>;
+ await assert.rejects(createPhotoSafety(malformed).check(image));
+}
+console.log('PASS malformed/extra relevance output fails closed.');
